@@ -1,0 +1,8 @@
+{
+  "id": "microsoft_points_assistant",
+  "name": "微软积分助手",
+  "version": "1.0.0",
+  "description": "Microsoft Rewards 积分数据、账户规则与任务中心（原 Rewards 页与账户与规则页合并而来）",
+  "entry": "plugin.py",
+  "plugin_class": "MicrosoftPointsAssistantPlugin"
+}

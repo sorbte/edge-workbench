@@ -1,0 +1,8 @@
+edge_profile/
+downloads/
+runtime/
+__pycache__/
+*.pyc
+.mimosa/
+.v2c/
+*.log
