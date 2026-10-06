@@ -1,0 +1,9 @@
+{
+  "id": "chaoxing_assistant",
+  "name": "学习通助手",
+  "version": "1.0.0",
+  "description": "从学习通个人空间读取用户基本信息与全部学历课程，手动同步并学习未完成章节，在本机缓存登录信息。",
+  "entry": "plugin.py",
+  "worker_entry": "worker.py",
+  "plugin_class": "ChaoxingAssistantPlugin"
+}

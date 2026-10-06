@@ -4,6 +4,7 @@ import argparse
 import importlib.util
 import json
 import math
+import multiprocessing as mp
 import os
 import queue
 import random
@@ -88,10 +89,10 @@ COLORS = {
     "bg": "#f7f7f5",
     "panel": "#ffffff",
     "panel_alt": "#f1f1ef",
-    "border": "#e6e6e3",
-    "border_strong": "#d6d6d2",
+    "border": "#d7d7d1",
+    "border_strong": "#c5c5bf",
     "text": "#0d0d0d",
-    "muted": "#70706c",
+    "muted": "#62625e",
     "accent": "#0d0d0d",
     "accent_hover": "#2b2b28",
     "success": "#16a34a",
@@ -107,6 +108,7 @@ COLORS = {
 
 FONT_MONO = "Cascadia Mono"
 FONT_SANS = "Microsoft YaHei UI"
+UI_TEXT_MIN_SIZE = 12
 
 # Segoe MDL2 Assets 图标字形（Windows 自带图标字体），用于总览页图标按钮
 ICON_PLAY = "\uE768"        # 启动浏览器
@@ -133,7 +135,7 @@ def mono_font(size: int, weight: str = "normal") -> tuple[str, int, str]:
 
 
 def sans_font(size: int, weight: str = "normal") -> tuple[str, int, str]:
-    return (FONT_SANS, size, weight)
+    return (FONT_SANS, max(size, UI_TEXT_MIN_SIZE), weight)
 
 
 def now_text() -> str:
@@ -199,11 +201,11 @@ def copy_locked_sqlite(source: Path, destination: Path) -> Path:
     return destination
 
 
-def count_history_entries() -> int:
-    history = PROFILE_DIR / "Default" / "History"
+def count_history_entries(profile_dir: Path = PROFILE_DIR, runtime_dir: Path = RUNTIME_DIR) -> int:
+    history = profile_dir / "Default" / "History"
     if not history.exists():
         return 0
-    temp = RUNTIME_DIR / "_history_readonly.sqlite"
+    temp = runtime_dir / "_history_readonly.sqlite"
     try:
         copy_locked_sqlite(history, temp)
         connection = sqlite3.connect(f"file:{temp.as_posix()}?mode=ro", uri=True, timeout=3)
@@ -221,15 +223,15 @@ def count_history_entries() -> int:
                 pass
 
 
-def count_cookies_database() -> int:
+def count_cookies_database(profile_dir: Path = PROFILE_DIR, runtime_dir: Path = RUNTIME_DIR) -> int:
     cookie_paths = (
-        PROFILE_DIR / "Default" / "Network" / "Cookies",
-        PROFILE_DIR / "Default" / "Cookies",
+        profile_dir / "Default" / "Network" / "Cookies",
+        profile_dir / "Default" / "Cookies",
     )
     for source in cookie_paths:
         if not source.exists():
             continue
-        temp = RUNTIME_DIR / "_cookies_readonly.sqlite"
+        temp = runtime_dir / "_cookies_readonly.sqlite"
         try:
             copy_locked_sqlite(source, temp)
             connection = sqlite3.connect(f"file:{temp.as_posix()}?mode=ro", uri=True, timeout=3)
@@ -248,8 +250,8 @@ def count_cookies_database() -> int:
     return 0
 
 
-def profile_breakdown() -> dict[str, int]:
-    default = PROFILE_DIR / "Default"
+def profile_breakdown(profile_dir: Path = PROFILE_DIR, download_dir: Path = DOWNLOAD_DIR) -> dict[str, int]:
+    default = profile_dir / "Default"
     components = {
         "HTTP 缓存": [default / "Cache", default / "Code Cache", default / "GPUCache"],
         "站点数据": [
@@ -279,11 +281,11 @@ def profile_breakdown() -> dict[str, int]:
     return result
 
 
-def append_operation(entry: dict[str, Any]) -> None:
+def append_operation(entry: dict[str, Any], log_path: Path = OPERATIONS_LOG) -> None:
     payload = {"timestamp": now_text(), **entry}
     try:
-        OPERATIONS_LOG.parent.mkdir(parents=True, exist_ok=True)
-        with OPERATIONS_LOG.open("a", encoding="utf-8") as file:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("a", encoding="utf-8") as file:
             file.write(json.dumps(payload, ensure_ascii=False) + "\n")
     except OSError:
         pass
@@ -587,22 +589,49 @@ class TaskCancelled(Exception):
 class BrowserWorker(threading.Thread):
     """Owns Playwright inside one thread so Tkinter remains responsive."""
 
-    def __init__(self, event_queue: queue.Queue[dict[str, Any]]) -> None:
-        super().__init__(name="edge-browser-worker", daemon=True)
+    def __init__(
+        self,
+        event_queue: Any,
+        *,
+        commands: Any | None = None,
+        name: str = "edge-browser-worker",
+        profile_dir: Path | None = None,
+        download_dir: Path | None = None,
+        runtime_dir: Path | None = None,
+        operations_log: Path | None = None,
+        cancel_event: Any | None = None,
+        namespace: str | None = None,
+    ) -> None:
+        super().__init__(name=name, daemon=True)
         self.events = event_queue
-        self.commands: queue.Queue[tuple[str, dict[str, Any]]] = queue.Queue()
+        self.commands = commands if commands is not None else queue.Queue()
         self.context = None
         self.playwright = None
         self.bound_pages: set[int] = set()
         self._shutting_down = False
         self._context_closing = False
-        self._cancel_event = threading.Event()
+        self._cancel_event = cancel_event if cancel_event is not None else threading.Event()
         self._search_running = False
         self._auto_running = False
         self._active_flow: str | None = None
         self.headless = False
         self._account_rules: dict[str, Any] = {}
         self.current_command: str | None = None
+        self.namespace = namespace
+        self.command_handlers: dict[str, Any] = {}
+        self.profile_dir = Path(profile_dir) if profile_dir is not None else PROFILE_DIR
+        self.download_dir = Path(download_dir) if download_dir is not None else DOWNLOAD_DIR
+        self.runtime_dir = Path(runtime_dir) if runtime_dir is not None else RUNTIME_DIR
+        self.state_dir = self.runtime_dir / "state_snapshots"
+        self.operations_log = Path(operations_log) if operations_log is not None else OPERATIONS_LOG
+        self.rewards_data_file = self.runtime_dir / "rewards_data.json"
+        self.rewards_account_file = self.runtime_dir / "rewards_account.json"
+        self.search_task_log = self.runtime_dir / "search_task.jsonl"
+        self.news_cache_file = self.runtime_dir / "news_cache.json"
+        self.test_click_screenshot = self.runtime_dir / "test_click.png"
+
+    def _append_operation(self, entry: dict[str, Any]) -> None:
+        append_operation(entry, self.operations_log)
 
     def submit(self, command: str, **payload: Any) -> None:
         self.commands.put((command, payload))
@@ -610,11 +639,13 @@ class BrowserWorker(threading.Thread):
     def emit(self, event_type: str, **payload: Any) -> None:
         if event_type == "search_task_status":
             payload["flow"] = self._active_flow or "search"
+        if self.namespace:
+            payload.setdefault("plugin_id", self.namespace)
         self.events.put({"type": event_type, **payload})
 
     def log(self, message: str, level: str = "info") -> None:
         self.emit("log", level=level, message=message)
-        append_operation({"event": "log", "level": level, "message": message})
+        self._append_operation({"event": "log", "level": level, "message": message})
 
     def run(self) -> None:
         while not self._shutting_down:
@@ -625,6 +656,8 @@ class BrowserWorker(threading.Thread):
 
             try:
                 self.current_command = command
+                if "headless" in payload:
+                    self.headless = bool(payload.get("headless"))
                 if command == "start":
                     self.start_browser()
                 elif command == "navigate":
@@ -661,7 +694,11 @@ class BrowserWorker(threading.Thread):
                     self._shutting_down = True
                     self.stop_browser()
                 else:
-                    self.log(f"未知命令: {command}", "warning")
+                    handler = self.command_handlers.get(command)
+                    if handler is None:
+                        self.log(f"Unknown command: {command}", "warning")
+                    else:
+                        handler(**payload)
             except Exception as exc:
                 self.log(f"操作失败: {exc}", "error")
                 self.emit("log", level="error", message=traceback.format_exc(limit=5))
@@ -690,8 +727,8 @@ class BrowserWorker(threading.Thread):
 
         self.emit("status", state="starting", detail="正在启动 Microsoft Edge…")
         self.log(f"使用 Edge: {edge}{'（隐藏模式，浏览器在后台运行）' if self.headless else ''}")
-        self.log(f"持久化资料目录: {PROFILE_DIR}")
-        append_operation({"event": "browser_start", "edge": str(edge), "profile": str(PROFILE_DIR), "headless": self.headless})
+        self.log(f"持久化资料目录: {self.profile_dir}")
+        self._append_operation({"event": "browser_start", "edge": str(edge), "profile": str(self.profile_dir), "headless": self.headless})
 
         self.playwright = sync_playwright().start()
         args = [
@@ -703,16 +740,21 @@ class BrowserWorker(threading.Thread):
             "--no-default-browser-check",
             "--disable-session-crashed-bubble",
             "--disable-blink-features=AutomationControlled",
+            "--disable-background-timer-throttling",
+            "--disable-renderer-backgrounding",
+            "--disable-backgrounding-occluded-windows",
+            "--disable-features=CalculateNativeWinOcclusion,IntensiveWakeUpThrottling",
+            "--autoplay-policy=no-user-gesture-required",
         ]
         if self.headless:
             args.append("--window-size=1440,900")
         self.context = self.playwright.chromium.launch_persistent_context(
-            user_data_dir=str(PROFILE_DIR),
+            user_data_dir=str(self.profile_dir),
             channel="msedge",
             headless=self.headless,
             no_viewport=True,
             accept_downloads=True,
-            downloads_path=str(DOWNLOAD_DIR),
+            downloads_path=str(self.download_dir),
             locale="zh-CN",
             timezone_id="Asia/Shanghai",
             args=args,
@@ -742,7 +784,7 @@ class BrowserWorker(threading.Thread):
             return
         self.emit("status", state="stopped", detail="Microsoft Edge 窗口已关闭")
         self.log("Microsoft Edge 已关闭，资料与缓存已保留。", "info")
-        append_operation({"event": "browser_closed_manually"})
+        self._append_operation({"event": "browser_closed_manually"})
 
     def _bind_page(self, page: Page) -> None:
         identity = id(page)
@@ -754,7 +796,7 @@ class BrowserWorker(threading.Thread):
             try:
                 if frame == page.main_frame:
                     self.emit("url", url=page.url)
-                    append_operation({"event": "navigation", "url": page.url})
+                    self._append_operation({"event": "navigation", "url": page.url})
             except Exception:
                 pass
 
@@ -803,7 +845,7 @@ class BrowserWorker(threading.Thread):
             title = ""
         self.emit("url", url=page.url)
         self.emit("page_count", count=self._page_count())
-        append_operation({"event": "page_view", "url": page.url, "title": title})
+        self._append_operation({"event": "page_view", "url": page.url, "title": title})
         self.log(f"页面已打开: {title or page.url}", "success")
 
     def navigate(self, raw_url: str) -> None:
@@ -815,7 +857,7 @@ class BrowserWorker(threading.Thread):
         """打开 cn.bing.com，把输入框内容逐字输入搜索框并回车搜索。"""
         page = self._current_page()
         query = str(query or "").strip()
-        append_operation({"event": "bing_search_start", "query": query[:80]})
+        self._append_operation({"event": "bing_search_start", "query": query[:80]})
         if query:
             self.log(f"必应搜索：正在打开 {HOME_URL}，输入关键词「{query[:60]}」…")
         else:
@@ -862,7 +904,7 @@ class BrowserWorker(threading.Thread):
             pass
         page.wait_for_timeout(800)
         self.log(f"必应搜索完成：{query[:60]}", "success")
-        append_operation({"event": "bing_search_complete", "query": query[:80], "url": page.url})
+        self._append_operation({"event": "bing_search_complete", "query": query[:80], "url": page.url})
         self.emit("url", url=page.url)
         self.emit("status", state="running", detail="必应搜索完成")
         self.publish_stats()
@@ -897,7 +939,7 @@ class BrowserWorker(threading.Thread):
 
         query = "Microsoft Edge 浏览器缓存"
         self.log("模拟真实用户操作：寻找搜索框 → 点击 → 逐字输入 → 回车 → 阅读滚动。")
-        append_operation({"event": "simulation_start", "query": query})
+        self._append_operation({"event": "simulation_start", "query": query})
 
         search_box = page.locator("#sb_form_q").first
         try:
@@ -938,7 +980,7 @@ class BrowserWorker(threading.Thread):
         except Exception:
             title = ""
         self.emit("url", url=page.url)
-        append_operation({"event": "simulation_complete", "url": page.url, "title": title})
+        self._append_operation({"event": "simulation_complete", "url": page.url, "title": title})
         self.log(f"模拟浏览完成，当前页面: {title or page.url}", "success")
         self.emit("status", state="running", detail="模拟浏览完成，新增缓存已写入磁盘")
         self.publish_stats()
@@ -1029,7 +1071,7 @@ class BrowserWorker(threading.Thread):
         original_url = page.url
         self.emit("account_info_status", state="loading", message="正在获取 Rewards 全部数据…")
         self.log("开始获取 Rewards 全部数据（基本数据 + 账户与积分规则），单次读取。")
-        append_operation({"event": "rewards_fetch_start", "original_url": original_url})
+        self._append_operation({"event": "rewards_fetch_start", "original_url": original_url})
         try:
             earn, dashboard = self._extract_earn_and_dashboard(page)
             account = self._extract_rewards_account_info(page)
@@ -1042,13 +1084,13 @@ class BrowserWorker(threading.Thread):
                 "dashboard": dashboard,
                 "note": "仅提取页面上的公开可见状态文本；不会自动领取或提交任务。",
             }
-            REWARDS_DATA_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-            append_operation({
+            self.rewards_data_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            self._append_operation({
                 "event": "rewards_fetch_complete",
                 "today_points": summary.get("today_points"),
                 "daily_tasks_completed": summary.get("daily_tasks_completed"),
                 "daily_tasks_pending": summary.get("daily_tasks_pending"),
-                "path": str(REWARDS_DATA_FILE),
+                "path": str(self.rewards_data_file),
             })
             tasks = summary.get("daily_tasks", [])
             task_preview = "；".join(
@@ -1107,15 +1149,15 @@ class BrowserWorker(threading.Thread):
                 "search_rules": search_rules,
                 "note": "账户信息与积分规则仅用于本地搜索计划计算。",
             }
-            REWARDS_ACCOUNT_FILE.write_text(json.dumps(account_payload, ensure_ascii=False, indent=2), encoding="utf-8")
-            append_operation({
+            self.rewards_account_file.write_text(json.dumps(account_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            self._append_operation({
                 "event": "account_info_fetch_complete",
                 "username": account.get("username"),
                 "membership_level": account.get("membership_level"),
                 "available_points": account.get("available_points"),
                 "points_per_search": search_rules.get("points_per_search"),
                 "daily_search_limit": search_rules.get("daily_search_limit"),
-                "path": str(REWARDS_ACCOUNT_FILE),
+                "path": str(self.rewards_account_file),
             })
             self.log(
                 f"账户: {account.get('username') or '--'}，等级 {search_rules.get('current_tier')}，"
@@ -1148,7 +1190,7 @@ class BrowserWorker(threading.Thread):
         page = self._current_page()
         original_url = page.url
         self.log("开始获取 Microsoft Rewards 基本数据……")
-        append_operation({"event": "rewards_fetch_start", "original_url": original_url})
+        self._append_operation({"event": "rewards_fetch_start", "original_url": original_url})
         try:
             earn, dashboard = self._extract_earn_and_dashboard(page)
             summary = self._summarize_rewards(earn, dashboard)
@@ -1159,13 +1201,13 @@ class BrowserWorker(threading.Thread):
                 "dashboard": dashboard,
                 "note": "仅提取页面上的公开可见状态文本；不会自动领取或提交任务。",
             }
-            REWARDS_DATA_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-            append_operation({
+            self.rewards_data_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            self._append_operation({
                 "event": "rewards_fetch_complete",
                 "today_points": summary.get("today_points"),
                 "daily_tasks_completed": summary.get("daily_tasks_completed"),
                 "daily_tasks_pending": summary.get("daily_tasks_pending"),
-                "path": str(REWARDS_DATA_FILE),
+                "path": str(self.rewards_data_file),
             })
 
             tasks = summary.get("daily_tasks", [])
@@ -1222,10 +1264,10 @@ class BrowserWorker(threading.Thread):
                 raise RuntimeError(f"测试点击失败，没有找到可安全点击的目标: {exc}") from exc
 
         try:
-            page.screenshot(path=str(TEST_CLICK_SCREENSHOT), full_page=False)
+            page.screenshot(path=str(self.test_click_screenshot), full_page=False)
         except Exception:
             pass
-        append_operation({"event": "test_click", "url": page.url, "target": target, "success": clicked})
+        self._append_operation({"event": "test_click", "url": page.url, "target": target, "success": clicked})
         self.emit("status", state="running", detail=f"测试点击成功：{target[:36]}")
 
     def cancel_search_task(self) -> None:
@@ -1239,8 +1281,8 @@ class BrowserWorker(threading.Thread):
     def _search_task_log(self, entry: dict[str, Any]) -> None:
         payload = {"timestamp": now_text(), **entry}
         try:
-            SEARCH_TASK_LOG.parent.mkdir(parents=True, exist_ok=True)
-            with SEARCH_TASK_LOG.open("a", encoding="utf-8") as file:
+            self.search_task_log.parent.mkdir(parents=True, exist_ok=True)
+            with self.search_task_log.open("a", encoding="utf-8") as file:
                 file.write(json.dumps(payload, ensure_ascii=False) + "\n")
         except OSError:
             pass
@@ -1326,9 +1368,9 @@ class BrowserWorker(threading.Thread):
     def _load_cached_account_rules(self) -> dict[str, Any]:
         if self._account_rules:
             return self._account_rules
-        if REWARDS_ACCOUNT_FILE.exists():
+        if self.rewards_account_file.exists():
             try:
-                payload = json.loads(REWARDS_ACCOUNT_FILE.read_text(encoding="utf-8"))
+                payload = json.loads(self.rewards_account_file.read_text(encoding="utf-8"))
                 rules = payload.get("search_rules") or (payload.get("rules") or {}).get("search_rules") or {}
                 if isinstance(rules, dict):
                     self._account_rules = rules
@@ -1429,7 +1471,7 @@ class BrowserWorker(threading.Thread):
                 "available": len(items),
                 "items": selected,
             }
-            NEWS_CACHE_FILE.write_text(json.dumps(cache_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            self.news_cache_file.write_text(json.dumps(cache_payload, ensure_ascii=False, indent=2), encoding="utf-8")
             self._search_task_log({"event": "news_fetch", "requested": count, "available": len(items), "selected": len(selected)})
             return selected
         finally:
@@ -1501,9 +1543,9 @@ class BrowserWorker(threading.Thread):
         earn = self._extract_rewards_page(page)
         earn.pop("raw_text_preview", None)
         payload: dict[str, Any] = {}
-        if REWARDS_DATA_FILE.exists():
+        if self.rewards_data_file.exists():
             try:
-                payload = json.loads(REWARDS_DATA_FILE.read_text(encoding="utf-8"))
+                payload = json.loads(self.rewards_data_file.read_text(encoding="utf-8"))
             except Exception:
                 payload = {}
         dashboard = payload.get("dashboard", {})
@@ -1515,7 +1557,7 @@ class BrowserWorker(threading.Thread):
             "dashboard": dashboard,
             "note": "搜索任务校准结果；不会自动提交或领取任务。",
         })
-        REWARDS_DATA_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        self.rewards_data_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         self._search_task_log({
             "event": "calibration",
             "account_points": summary.get("account_points"),
@@ -1551,7 +1593,7 @@ class BrowserWorker(threading.Thread):
         return self._calibrate_rewards_points(page)
 
     def auto_run(self) -> None:
-        """一键化流程：启动浏览器 → 获取全部数据 → 搜索任务 → 每日任务 → 最终同步。"""
+        """一键化流程：启动浏览器 → 刷新全部数据 → 搜索任务 → 每日任务 → 最终同步。"""
         if self._auto_running:
             self.log("一键自动化已经在运行。", "warning")
             return
@@ -1562,13 +1604,13 @@ class BrowserWorker(threading.Thread):
         self._cancel_event.clear()  # 清掉上次停止/取消残留的标志，避免新流程被误判取消
         try:
             self.emit("auto_status", state="started", message="一键自动化开始")
-            self.log("一键自动化开始：获取全部数据 → 搜索任务 → 每日任务 → 最终数据同步。")
+            self.log("一键自动化开始：刷新全部数据 → 搜索任务 → 每日任务 → 最终数据同步。")
             if self.context is None:
                 self.emit("auto_status", state="running", message="一键自动化：正在启动浏览器…")
                 self.log("浏览器未启动，正在自动启动 Edge。")
                 self.start_browser()
             steps = (
-                ("获取全部数据", self.fetch_rewards_data),
+                ("刷新全部数据", self.fetch_rewards_data),
                 ("搜索任务", self.run_search_task),
                 ("每日任务", self.trigger_incomplete_tasks),
                 ("最终数据同步", self.fetch_rewards_data),
@@ -1939,26 +1981,26 @@ class BrowserWorker(threading.Thread):
         ]
         pages = [self._collect_page_snapshot(page) for page in self.context.pages if not page.is_closed()]
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        target = STATE_DIR / f"state_{timestamp}.json"
+        target = self.state_dir / f"state_{timestamp}.json"
         payload = {
             "created_at": now_text(),
             "browser": "Microsoft Edge",
-            "profile_dir": str(PROFILE_DIR),
-            "cache_breakdown": profile_breakdown(),
+            "profile_dir": str(self.profile_dir),
+            "cache_breakdown": profile_breakdown(self.profile_dir, self.download_dir),
             "cookie_count": len(cookies),
             "cookie_metadata": cookie_summary,
             "pages": [snapshot.__dict__ for snapshot in pages],
             "note": "此文件只保存状态元数据，Cookies 的值仍保存在 Edge 资料目录内。",
         }
         target.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        append_operation({"event": "state_snapshot", "path": str(target), "cookie_count": len(cookies), "page_count": len(pages)})
+        self._append_operation({"event": "state_snapshot", "path": str(target), "cookie_count": len(cookies), "page_count": len(pages)})
         self.log(f"状态快照已保存: {target}", "success")
         self.emit("status", state="running", detail="状态快照已保存")
         self.emit("snapshot_saved", path=str(target))
 
     def publish_stats(self) -> None:
-        breakdown = profile_breakdown()
-        cookie_count = count_cookies_database()
+        breakdown = profile_breakdown(self.profile_dir, self.download_dir)
+        cookie_count = count_cookies_database(self.profile_dir, self.runtime_dir)
         if self.context is not None:
             try:
                 cookie_count = len(self.context.cookies())
@@ -1972,9 +2014,9 @@ class BrowserWorker(threading.Thread):
             "history_size": breakdown.get("历史记录", 0),
             "removable_cache": breakdown.get("可回收缓存", 0),
             "cookie_count": cookie_count,
-            "history_count": count_history_entries(),
+            "history_count": count_history_entries(self.profile_dir, self.runtime_dir),
             "page_count": self._page_count(),
-            "profile_dir": str(PROFILE_DIR),
+            "profile_dir": str(self.profile_dir),
             "breakdown": breakdown,
         }
         self.emit("stats", data=data)
@@ -1998,7 +2040,7 @@ class BrowserWorker(threading.Thread):
             finally:
                 self._context_closing = False
             self.log("Microsoft Edge 已停止，所有缓存和浏览数据已写入磁盘。如需继续浏览，可点击「启动浏览器」。", "success")
-            append_operation({"event": "browser_stop"})
+            self._append_operation({"event": "browser_stop"})
         if self.playwright is not None:
             try:
                 self.playwright.stop()
@@ -2008,10 +2050,9 @@ class BrowserWorker(threading.Thread):
         self.bound_pages.clear()
         self.emit("status", state="stopped", detail="Microsoft Edge 未运行")
         self.emit("page_count", count=0)
-    @staticmethod
-    def _safe_remove_inside_profile(path: Path) -> bool:
+    def _safe_remove_inside_profile(self, path: Path) -> bool:
         try:
-            base = PROFILE_DIR.resolve()
+            base = self.profile_dir.resolve()
             target = path.resolve()
             if target.is_symlink():
                 return False
@@ -2033,15 +2074,15 @@ class BrowserWorker(threading.Thread):
         if self.context is not None:
             self.log("清理缓存前先停止 Microsoft Edge。", "warning")
             self.stop_browser()
-        breakdown_before = profile_breakdown()
+        breakdown_before = profile_breakdown(self.profile_dir, self.download_dir)
         before = breakdown_before.get("全部用户数据", 0)
         removable_before = breakdown_before.get("可回收缓存", 0)
         removed: list[str] = []
         for relative in SAFE_CACHE_RELATIVE_PATHS:
-            path = PROFILE_DIR / relative
+            path = self.profile_dir / relative
             if self._safe_remove_inside_profile(path):
                 removed.append(relative)
-        breakdown_after = profile_breakdown()
+        breakdown_after = profile_breakdown(self.profile_dir, self.download_dir)
         after = breakdown_after.get("全部用户数据", 0)
         freed = max(0, before - after)
         self.log(
@@ -2050,7 +2091,7 @@ class BrowserWorker(threading.Thread):
             f"登录、Cookies、历史、LocalStorage、IndexedDB 和 Service Worker 均保留。",
             "success",
         )
-        append_operation({
+        self._append_operation({
             "event": "cache_cleanup",
             "before": before,
             "after": after,
@@ -2066,19 +2107,224 @@ class BrowserWorker(threading.Thread):
         self.emit("status", state="stopped", detail="缓存已清理，Microsoft Edge 未运行；可点击「启动浏览器」继续")
 
 
+def _plugin_process_main(
+    plugin_id: str,
+    profile_dir: str,
+    download_dir: str,
+    runtime_dir: str,
+    worker_entry: str,
+    command_queue: Any,
+    event_queue: Any,
+    cancel_event: Any,
+) -> None:
+    """Run one isolated Playwright worker inside a dedicated plugin process."""
+    try:
+        worker = BrowserWorker(
+            event_queue,
+            commands=command_queue,
+            name=f"plugin-{plugin_id}",
+            profile_dir=Path(profile_dir),
+            download_dir=Path(download_dir),
+            runtime_dir=Path(runtime_dir),
+            operations_log=Path(runtime_dir) / "operations.jsonl",
+            cancel_event=cancel_event,
+            namespace=plugin_id,
+        )
+        if worker_entry:
+            worker_path = Path(worker_entry)
+            spec = importlib.util.spec_from_file_location(
+                f"workbench_plugin_worker_{plugin_id}", worker_path
+            )
+            if spec is None or spec.loader is None:
+                raise ImportError(f"Cannot load plugin worker: {worker_path}")
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            register = getattr(module, "register", None)
+            if not callable(register):
+                raise AttributeError(f"Plugin worker missing register(worker): {worker_path}")
+            register(worker)
+        worker.run()
+    except BaseException as exc:
+        try:
+            event_queue.put({
+                "type": "plugin_process_error",
+                "plugin_id": plugin_id,
+                "message": str(exc),
+                "traceback": traceback.format_exc(limit=8),
+            })
+        except Exception:
+            pass
+
+
+class PluginProcessRuntime:
+    """主进程侧代理：把插件命令和事件绑定到独立子进程。"""
+
+    def __init__(
+        self,
+        plugin_id: str,
+        *,
+        profile_dir: Path,
+        download_dir: Path,
+        runtime_dir: Path,
+        worker_entry: Path | None = None,
+        status_callback: Any | None = None,
+    ) -> None:
+        self.plugin_id = plugin_id
+        self.profile_dir = profile_dir
+        self.download_dir = download_dir
+        self.runtime_dir = runtime_dir
+        self.worker_entry = worker_entry
+        self.status_callback = status_callback
+        self.headless = False
+        self._ctx = mp.get_context("spawn")
+        self.commands = self._ctx.Queue()
+        self.events = self._ctx.Queue()
+        self.cancel_event = self._ctx.Event()
+        self.process: Any | None = None
+        self.current_command: str | None = None
+        self._busy = False
+        self._closing = False
+        self._exit_reported = False
+
+    @property
+    def process_id(self) -> int | None:
+        return self.process.pid if self.process is not None and self.process.is_alive() else None
+
+    def _notify(self, state: str, text: str, detail: str = "") -> None:
+        if self.status_callback is None:
+            return
+        try:
+            self.status_callback(self.plugin_id, state, text, detail)
+        except Exception:
+            pass
+
+    def start(self) -> None:
+        if self.process is not None and self.process.is_alive():
+            return
+        for path in (self.runtime_dir, self.profile_dir, self.download_dir):
+            path.mkdir(parents=True, exist_ok=True)
+        self.process = self._ctx.Process(
+            target=_plugin_process_main,
+            args=(
+                self.plugin_id,
+                str(self.profile_dir),
+                str(self.download_dir),
+                str(self.runtime_dir),
+                str(self.worker_entry or ""),
+                self.commands,
+                self.events,
+                self.cancel_event,
+            ),
+            name=f"plugin-{self.plugin_id}",
+            daemon=True,
+        )
+        self.process.start()
+        self._exit_reported = False
+
+    def submit(self, command: str, **payload: Any) -> None:
+        self.start()
+        self.current_command = command
+        self._busy = True
+        self.cancel_event.clear()
+        self._notify("running", "运行中", command)
+        self.commands.put((command, {"headless": self.headless, **payload}))
+
+    def cancel(self) -> None:
+        if self._busy:
+            self.cancel_event.set()
+            self._notify("cancelling", "取消中", self.current_command or "")
+
+    def cancel_search_task(self) -> None:
+        self.cancel()
+
+    def is_running(self) -> bool:
+        return self._busy
+
+    def poll_events(self, limit: int = 300) -> list[dict[str, Any]]:
+        events: list[dict[str, Any]] = []
+        while len(events) < limit:
+            try:
+                event = self.events.get_nowait()
+            except queue.Empty:
+                break
+            if event.get("type") == "command_done":
+                self._busy = False
+                self.current_command = None
+            events.append(event)
+
+        if self.process is not None and not self.process.is_alive() and not self._closing and not self._exit_reported:
+            self._exit_reported = True
+            self._busy = False
+            exit_code = self.process.exitcode
+            events.append({
+                "type": "plugin_process_error",
+                "plugin_id": self.plugin_id,
+                "message": f"插件进程已退出（exit code={exit_code}）",
+            })
+            self._notify("error", "异常", f"进程退出: {exit_code}")
+        return events
+
+    def close(self, timeout: float = 2.0) -> None:
+        if self.process is None:
+            return
+        self._closing = True
+        if self.process.is_alive():
+            try:
+                self.commands.put(("shutdown", {}))
+                self.process.join(timeout)
+            except Exception:
+                pass
+        if self.process.is_alive():
+            try:
+                self.process.terminate()
+                self.process.join(1.0)
+            except Exception:
+                pass
+        self._busy = False
+        self.current_command = None
+
 
 class WorkbenchPlugin:
-    """工作台插件基类：由 PluginManager 加载，向侧栏贡献页面并接收 worker 事件流。
-
-    插件通过 `from edge_workbench import ...` 使用宿主的颜色、字体、图标等 UI 套件，
-    通过 self.app 复用宿主的卡片/按钮/图标按钮等构建方法与日志。
-    """
+    """Workbench plugin base with an isolated browser process."""
 
     def __init__(self, manifest: dict[str, Any], app: Any) -> None:
         self.manifest = manifest
         self.app = app
-        self.worker = app.worker
-        self._active = True  # 热卸载后置 False，插件应停止自身调度的后台任务
+        plugin_id = str(manifest.get("id") or manifest.get("_folder") or "plugin")
+        self.runtime_dir = RUNTIME_DIR / "plugins" / plugin_id
+        self.profile_dir = PROFILE_DIR / "plugins" / plugin_id
+        self.download_dir = DOWNLOAD_DIR / plugin_id
+        self.state_dir = self.runtime_dir / "state_snapshots"
+        self.rewards_data_file = self.runtime_dir / "rewards_data.json"
+        self.rewards_account_file = self.runtime_dir / "rewards_account.json"
+        self.search_task_log = self.runtime_dir / "search_task.jsonl"
+        self.news_cache_file = self.runtime_dir / "news_cache.json"
+        self.test_click_screenshot = self.runtime_dir / "test_click.png"
+        for path in (self.runtime_dir, self.profile_dir, self.download_dir, self.state_dir):
+            path.mkdir(parents=True, exist_ok=True)
+        if plugin_id == "microsoft_points_assistant":
+            for source, target in (
+                (REWARDS_DATA_FILE, self.rewards_data_file),
+                (REWARDS_ACCOUNT_FILE, self.rewards_account_file),
+            ):
+                if source.exists() and not target.exists():
+                    try:
+                        shutil.copy2(source, target)
+                    except OSError:
+                        pass
+        folder = str(manifest.get("_folder") or plugin_id)
+        worker_entry_name = str(manifest.get("worker_entry") or "")
+        worker_entry = PLUGINS_DIR / folder / worker_entry_name if worker_entry_name else None
+        self.runtime = PluginProcessRuntime(
+            plugin_id,
+            profile_dir=self.profile_dir,
+            download_dir=self.download_dir,
+            runtime_dir=self.runtime_dir,
+            worker_entry=worker_entry,
+            status_callback=getattr(app, "_set_plugin_status", None),
+        )
+        self.worker = self.runtime
+        self._active = True
 
     @property
     def id(self) -> str:
@@ -2088,15 +2334,23 @@ class WorkbenchPlugin:
     def display_name(self) -> str:
         return str(self.manifest.get("name") or self.id)
 
+    def submit(self, command: str, **payload: Any) -> None:
+        self.runtime.submit(command, **payload)
+
+    def is_running(self) -> bool:
+        return self.runtime.is_running()
+
     def on_unload(self) -> None:
-        """插件被热卸载前调用：子类应停掉自身调度的后台任务（如 after 回调）。"""
+        """Stop this plugin's isolated process before unloading."""
+        self._active = False
+        self.runtime.close()
 
     def build_pages(self, parent: Any) -> list[tuple[str, str, Any]]:
-        """返回 [(page_key, 侧栏标题, 页面框架)]；宿主构建内容区后调用。"""
+        """Return [(page_key, sidebar_label, frame)]."""
         return []
 
     def handle_event(self, _event: dict[str, Any]) -> None:
-        """worker 事件流分发；插件只处理自己关心的事件类型。"""
+        """Handle events emitted by this plugin's isolated worker process."""
 
     def log(self, message: str, level: str = "info") -> None:
         self.app._append_log(message, level)
@@ -2110,7 +2364,13 @@ class PluginManager:
     """
 
     # 分发给插件的事件类型：与功能插件相关的 worker 事件流
-    PLUGIN_EVENT_TYPES = {"rewards_data", "rewards_account", "account_info_status", "search_task_status", "auto_status"}
+    PLUGIN_EVENT_TYPES = {
+        "rewards_data", "rewards_account", "account_info_status", "search_task_status",
+        "auto_status", "status", "command_done", "plugin_process_error",
+        "chaoxing_page", "chaoxing_run_status", "chaoxing_grade_status", "chaoxing_grade_done",
+        "chaoxing_profile_status", "chaoxing_profile_data", "chaoxing_courses_data",
+        "chaoxing_course_detail_status", "chaoxing_course_detail_data",
+    }
 
     def __init__(self, app: Any) -> None:
         self.app = app
@@ -2207,13 +2467,36 @@ class PluginManager:
         except OSError as exc:
             self.app._append_log(f"无法写入插件设置：{exc}", "warning")
 
-    def dispatch(self, event: dict[str, Any]) -> None:
+    def poll_events(self) -> list[dict[str, Any]]:
+        """Drain events from every isolated plugin process."""
+        events: list[dict[str, Any]] = []
+        for plugin in list(self.plugins):
+            try:
+                events.extend(plugin.runtime.poll_events())
+            except Exception as exc:
+                events.append({
+                    "type": "plugin_process_error",
+                    "plugin_id": plugin.id,
+                    "message": f"读取插件进程事件失败: {exc}",
+                })
+        return events
+
+    def shutdown_all(self) -> None:
+        for plugin in list(self.plugins):
+            try:
+                plugin.runtime.close()
+            except Exception:
+                pass
+
+    def dispatch(self, event: dict[str, Any], plugin_id: str | None = None) -> None:
+        target_id = plugin_id or event.get("plugin_id")
         for plugin in self.plugins:
+            if target_id and plugin.id != target_id:
+                continue
             try:
                 plugin.handle_event(event)
             except Exception as exc:
                 self.app._append_log(f"插件事件处理异常 {plugin.id}: {exc}", "warning")
-
 
 class EdgeWorkbenchApp(ctk.CTk):
     def __init__(self) -> None:
@@ -2231,9 +2514,13 @@ class EdgeWorkbenchApp(ctk.CTk):
         self._drag_offset_x = 0
         self._drag_offset_y = 0
         self._resize_origin = (0, 0, 0, 0)
+        self._resizing = False
         self._current_page = ""
         self._closing = False
         self._close_deadline = 0.0
+        self._busy_text = ""
+        self._plugin_status: dict[str, dict[str, str]] = {}
+        self._nav_labels: dict[str, str] = {}
 
         self.events: queue.Queue[dict[str, Any]] = queue.Queue()
         self.worker = BrowserWorker(self.events)
@@ -2387,7 +2674,7 @@ class EdgeWorkbenchApp(ctk.CTk):
 
     @staticmethod
     def _section_label(parent: Any, text: str, top: int = 14) -> ctk.CTkLabel:
-        label = ctk.CTkLabel(parent, text=text, text_color=COLORS["muted"], font=mono_font(10, "bold"), anchor="w")
+        label = ctk.CTkLabel(parent, text=text, text_color=COLORS["muted"], font=sans_font(12, "bold"), anchor="w")
         label.pack(fill="x", padx=16, pady=(top, 6))
         return label
 
@@ -2434,10 +2721,6 @@ class EdgeWorkbenchApp(ctk.CTk):
             work_x, work_y, work_w, work_h = self._work_area()
             self.geometry(f"{work_w}x{work_h}+{work_x}+{work_y}")
             self._maximized = True
-        try:
-            self.resize_grip.place_forget() if self._maximized else self.resize_grip.place(relx=1.0, rely=1.0, anchor="se", x=-3, y=-3)
-        except Exception:
-            pass
 
     def _work_area(self) -> tuple[int, int, int, int]:
         try:
@@ -2457,13 +2740,26 @@ class EdgeWorkbenchApp(ctk.CTk):
             self.iconify()
 
     def _start_resize(self, event: Any) -> None:
-        self._resize_origin = (event.x_root, event.y_root, self.winfo_width(), self.winfo_height())
+        if self._maximized:
+            self._resizing = False
+            return
+        x = event.x_root - self.winfo_rootx()
+        y = event.y_root - self.winfo_rooty()
+        in_corner = x >= self.winfo_width() - 24 and y >= self.winfo_height() - 24
+        self._resizing = in_corner
+        if in_corner:
+            self._resize_origin = (event.x_root, event.y_root, self.winfo_width(), self.winfo_height())
 
     def _on_resize(self, event: Any) -> None:
+        if not self._resizing:
+            return
         start_x, start_y, start_w, start_h = self._resize_origin
         width = max(1040, start_w + (event.x_root - start_x))
         height = max(720, start_h + (event.y_root - start_y))
         self.geometry(f"{width}x{height}")
+
+    def _finish_resize(self, _event: Any) -> None:
+        self._resizing = False
 
     def _build_ui(self) -> None:
         self._build_titlebar()
@@ -2512,12 +2808,14 @@ class EdgeWorkbenchApp(ctk.CTk):
         for page in self.pages.values():
             page.grid(row=0, column=0, sticky="nsew")
         self._build_nav(sidebar, nav_items)
+        for plugin in self.plugin_manager.plugins:
+            self._set_plugin_status(plugin.id, "idle", "未启动")
         self._show_page(nav_items[0][0] if nav_items else "overview")
 
-        self.resize_grip = ctk.CTkLabel(self, text="", width=24, height=24, fg_color="transparent")
-        self.resize_grip.place(relx=1.0, rely=1.0, anchor="se", x=-2, y=-2)
-        self.resize_grip.bind("<ButtonPress-1>", self._start_resize)
-        self.resize_grip.bind("<B1-Motion>", self._on_resize)
+        # 右下角使用透明热区缩放窗口，不再显示可见方块。
+        self.bind_all("<ButtonPress-1>", self._start_resize, add="+")
+        self.bind_all("<B1-Motion>", self._on_resize, add="+")
+        self.bind_all("<ButtonRelease-1>", self._finish_resize, add="+")
 
     def _build_nav(self, sidebar: Any, nav_items: list[tuple[str, str]]) -> None:
         self._sidebar = sidebar
@@ -2526,7 +2824,7 @@ class EdgeWorkbenchApp(ctk.CTk):
         footer = ctk.CTkFrame(sidebar, fg_color="transparent")
         footer.pack(side="bottom", fill="x", padx=18, pady=16)
         ctk.CTkLabel(footer, text="channel=msedge", text_color=COLORS["muted"], font=mono_font(10), anchor="w").pack(fill="x")
-        self._nav_footer_label = ctk.CTkLabel(footer, text="", text_color=COLORS["muted"], font=mono_font(10), anchor="w")
+        self._nav_footer_label = ctk.CTkLabel(footer, text="", text_color=COLORS["muted"], font=sans_font(11), anchor="w")
         self._nav_footer_label.pack(fill="x", pady=(3, 0))
         self._update_nav_footer()
 
@@ -2555,9 +2853,10 @@ class EdgeWorkbenchApp(ctk.CTk):
         item.place(x=-int(nav_overflow * scaling), rely=0.5, anchor="w")
         item.bind("<Button-1>", lambda _event, page=key: self._show_page(page))
         item.bind("<Enter>", lambda _event, widget=item: widget.configure(text_color=COLORS["text"]) if widget.cget("fg_color") == "transparent" else None)
-        item.bind("<Leave>", lambda _event, widget=item: widget.configure(text_color=COLORS["muted"]) if widget.cget("fg_color") == "transparent" else None)
+        item.bind("<Leave>", lambda _event, page=key: self._refresh_nav_item(page))
         self._nav_containers[key] = container
         self._nav_buttons[key] = item
+        self._nav_labels[key] = label
         self._sync_nav_order()
         self._rebind_nav_hotkeys()
         self._update_nav_footer()
@@ -2567,6 +2866,7 @@ class EdgeWorkbenchApp(ctk.CTk):
         if container is not None:
             container.destroy()
         self._nav_buttons.pop(key, None)
+        self._nav_labels.pop(key, None)
         self._sync_nav_order()
         self._rebind_nav_hotkeys()
         self._update_nav_footer()
@@ -2665,32 +2965,87 @@ class EdgeWorkbenchApp(ctk.CTk):
         self._window_button(controls, "□", self._toggle_maximize, "#e9e9e6").pack(side="left", padx=2)
         self._window_button(controls, "✕", self._on_close, "#fee2e2").pack(side="left", padx=2)
 
-        status = ctk.CTkFrame(self.title_bar, width=120, height=30, fg_color=COLORS["panel"], corner_radius=15, border_width=1, border_color=COLORS["border"])
-        status.pack(side="right", padx=(0, 10), pady=8)
-        status.pack_propagate(False)
-        self.status_dot = ctk.CTkLabel(status, text="●", text_color=COLORS["muted"], font=("Segoe UI", 12))
-        self.status_dot.pack(side="left", padx=(11, 5))
-        ctk.CTkLabel(status, textvariable=self._status_var, text_color=COLORS["text"], font=mono_font(10, "bold")).pack(side="left")
-        self.busy_label = ctk.CTkLabel(self.title_bar, text="", text_color=COLORS["muted"], font=mono_font(10))
-        self.busy_label.pack(side="right", padx=(0, 6))
-
         for widget in (self.title_bar, brand, self._brand_title, self._brand_subtitle):
             widget.bind("<ButtonPress-1>", self._start_drag)
             widget.bind("<B1-Motion>", self._on_drag)
             widget.bind("<Double-Button-1>", lambda _event: self._toggle_maximize())
 
+    def _set_busy(self, text: str = "") -> None:
+        """Keep legacy busy-state messages without showing a global top bar."""
+        self._busy_text = text
+
     def _show_page(self, page_name: str) -> None:
         self._current_page = page_name
         for key, button in self._nav_buttons.items():
-            if key == page_name:
-                button.configure(fg_color=COLORS["panel"], text_color=COLORS["text"])
-            else:
-                button.configure(fg_color="transparent", text_color=COLORS["muted"])
+            selected = key == page_name
+            button.configure(
+                fg_color=COLORS["panel"] if selected else "transparent",
+                text_color=self._nav_item_color(key, selected),
+            )
         for key, page in self.pages.items():
             if key == page_name:
                 page.grid(row=0, column=0, sticky="nsew")
             else:
                 page.grid_remove()
+
+    def _plugin_id_for_page(self, page_key: str) -> str | None:
+        for plugin_id, keys in getattr(self, "_plugin_page_keys", {}).items():
+            if page_key in keys:
+                return plugin_id
+        return None
+
+    def _nav_item_color(self, page_key: str, selected: bool = False) -> str:
+        plugin_id = self._plugin_id_for_page(page_key)
+        status = self._plugin_status.get(plugin_id, {}) if plugin_id else {}
+        state = str(status.get("state") or "")
+        if state in {"idle", "stopped", ""}:
+            return COLORS["text"] if selected else COLORS["muted"]
+        return str(status.get("color") or (COLORS["text"] if selected else COLORS["muted"]))
+
+    def _refresh_nav_item(self, page_key: str) -> None:
+        item = self._nav_buttons.get(page_key)
+        if item is None:
+            return
+        selected = page_key == self._current_page
+        try:
+            item.configure(text_color=self._nav_item_color(page_key, selected))
+        except tk.TclError:
+            pass
+
+    def _set_plugin_status(self, plugin_id: str, state: str, text: str = "", detail: str = "") -> None:
+        """Store and render sidebar-level status for one isolated plugin."""
+        mapping = {
+            "idle": ("未启动", COLORS["muted"]),
+            "stopped": ("未启动", COLORS["muted"]),
+            "ready": ("就绪", COLORS["accent"]),
+            "starting": ("启动中", COLORS["warning"]),
+            "running": ("运行中", COLORS["success"]),
+            "cancelling": ("取消中", COLORS["warning"]),
+            "done": ("已完成", COLORS["success"]),
+            "error": ("异常", COLORS["danger"]),
+            "cancelled": ("已取消", COLORS["warning"]),
+        }
+        default_text, color = mapping.get(str(state), ("运行中", COLORS["success"]))
+        short_text = str(text or default_text).strip()
+        if len(short_text) > 5:
+            short_text = default_text
+        self._plugin_status[plugin_id] = {
+            "state": str(state),
+            "text": short_text,
+            "detail": str(detail),
+            "color": color,
+        }
+        page_keys = getattr(self, "_plugin_page_keys", {}).get(plugin_id, [])
+        if page_keys:
+            key = page_keys[0]
+            item = self._nav_buttons.get(key)
+            base_label = self._nav_labels.get(key, plugin_id)
+            if item is not None:
+                try:
+                    item.configure(text=f"{base_label}  ·  {short_text}")
+                    self._refresh_nav_item(key)
+                except tk.TclError:
+                    pass
 
     def _page_header(self, parent: Any, title: str, subtitle: str) -> None:
         header = ctk.CTkFrame(parent, fg_color="transparent")
@@ -2714,7 +3069,7 @@ class EdgeWorkbenchApp(ctk.CTk):
         self.headless_button.pack(side="left", padx=(0, 6))
         self.stop_button = self._icon_button(header_actions, ICON_STOP, self.stop_browser_and_task, "停止浏览器", "danger")
         self.stop_button.pack(side="left")
-        ctk.CTkLabel(header, textvariable=self._status_detail_var, text_color=COLORS["muted"], font=mono_font(10)).pack(side="right", padx=(0, 14))
+        ctk.CTkLabel(header, textvariable=self._status_detail_var, text_color=COLORS["muted"], font=sans_font(11)).pack(side="right", padx=(0, 14))
 
         command_bar = self._card(page, padded=True)
         self.url_entry = ctk.CTkEntry(
@@ -2746,7 +3101,7 @@ class EdgeWorkbenchApp(ctk.CTk):
         # 运行指标标题行：右侧工具图标（刷新 / 快照 / 清缓存 / 资料目录）
         metrics_header = ctk.CTkFrame(page, fg_color="transparent")
         metrics_header.pack(fill="x", padx=24, pady=(6, 0))
-        ctk.CTkLabel(metrics_header, text="TELEMETRY / 运行指标", text_color=COLORS["muted"], font=mono_font(10, "bold"), anchor="w").pack(side="left")
+        ctk.CTkLabel(metrics_header, text="TELEMETRY / 运行指标", text_color=COLORS["muted"], font=sans_font(12, "bold"), anchor="w").pack(side="left")
         telemetry_actions = ctk.CTkFrame(metrics_header, fg_color="transparent")
         telemetry_actions.pack(side="right")
         self.refresh_button = self._icon_button(telemetry_actions, ICON_REFRESH, self._request_stats, "刷新统计")
@@ -2779,8 +3134,8 @@ class EdgeWorkbenchApp(ctk.CTk):
 
         hint = ctk.CTkFrame(page, fg_color="transparent")
         hint.pack(fill="x", padx=24, pady=(0, 12))
-        ctk.CTkLabel(hint, text=f"$ edge: {find_edge_executable() or '未检测到'}", text_color=COLORS["muted"], font=mono_font(10)).pack(side="left")
-        ctk.CTkLabel(hint, textvariable=self._cache_cleanup_var, text_color=COLORS["muted"], font=mono_font(10)).pack(side="left", padx=(16, 0))
+        ctk.CTkLabel(hint, text=f"$ edge: {find_edge_executable() or '未检测到'}", text_color=COLORS["muted"], font=sans_font(11)).pack(side="left")
+        ctk.CTkLabel(hint, textvariable=self._cache_cleanup_var, text_color=COLORS["muted"], font=sans_font(11)).pack(side="left", padx=(16, 0))
         ctk.CTkLabel(hint, text=str(PROFILE_DIR), text_color=COLORS["muted"], font=mono_font(10)).pack(side="right")
         return page
 
@@ -2797,7 +3152,7 @@ class EdgeWorkbenchApp(ctk.CTk):
         container.rowconfigure(1, weight=1)
         title_row = tk.Frame(container, bg=COLORS["term_bg"])
         title_row.grid(row=0, column=0, columnspan=2, sticky="ew")
-        tk.Label(title_row, text="▌ operations — 实时事件流", bg=COLORS["term_bg"], fg=COLORS["term_muted"], font=(FONT_MONO, 10, "bold"), anchor="w", padx=12, pady=8).pack(fill="x")
+        tk.Label(title_row, text="▌ operations — 实时事件流", bg=COLORS["term_bg"], fg=COLORS["term_muted"], font=(FONT_SANS, 11, "bold"), anchor="w", padx=12, pady=8).pack(fill="x")
         self.log_text = tk.Text(
             container,
             bg=COLORS["term_bg"],
@@ -2809,7 +3164,7 @@ class EdgeWorkbenchApp(ctk.CTk):
             wrap="word",
             padx=12,
             pady=4,
-            font=(FONT_MONO, 10),
+            font=(FONT_MONO, 11),
             state="disabled",
         )
         self.log_text.grid(row=1, column=0, sticky="nsew")
@@ -2886,7 +3241,7 @@ class EdgeWorkbenchApp(ctk.CTk):
         row.pack(fill="x", padx=16, pady=(12, 4 if (description or error_text) else 12))
         controls = ctk.CTkFrame(row, fg_color="transparent")
         controls.pack(side="right")
-        ctk.CTkLabel(controls, text=self._plugin_status_text(manifest), text_color=COLORS["muted"], font=mono_font(10)).pack(side="left", padx=(0, 12))
+        ctk.CTkLabel(controls, text=self._plugin_status_text(manifest), text_color=COLORS["muted"], font=sans_font(11)).pack(side="left", padx=(0, 12))
         switch_var = tk.BooleanVar(value=manager.is_enabled(plugin_id))
         ctk.CTkSwitch(
             controls,
@@ -2912,7 +3267,7 @@ class EdgeWorkbenchApp(ctk.CTk):
         row = ctk.CTkFrame(card, fg_color="transparent")
         row.pack(fill="x", padx=16, pady=(12, 12))
         ctk.CTkLabel(row, text=folder, text_color=COLORS["text"], font=sans_font(13, "bold"), anchor="w").pack(side="left")
-        ctk.CTkLabel(row, text="已禁用", text_color=COLORS["muted"], font=mono_font(10)).pack(side="right")
+        ctk.CTkLabel(row, text="已禁用", text_color=COLORS["muted"], font=sans_font(11)).pack(side="right")
         ctk.CTkLabel(card, text=f"加载失败：{error}", text_color=COLORS["danger"], font=sans_font(10), anchor="w", justify="left", wraplength=760).pack(fill="x", padx=16, pady=(0, 12))
 
     def _plugin_status_text(self, manifest: dict[str, Any]) -> str:
@@ -2976,18 +3331,18 @@ class EdgeWorkbenchApp(ctk.CTk):
             page_keys.append(key)
         manager.plugins.append(plugin)
         self._plugin_page_keys[plugin_id] = page_keys
+        self._set_plugin_status(plugin_id, "idle", "未启动")
         self._rebuild_plugin_list()
         return True
 
     def _hot_unload_plugin(self, plugin_id: str) -> str | None:
-        """卸载插件页面与实例；返回拒绝/失败原因，None 表示成功。"""
+        """卸载插件页面与独立进程；返回拒绝/失败原因，None 表示成功。"""
         manager = self.plugin_manager
         plugin = next((p for p in manager.plugins if p.id == plugin_id), None)
         if plugin is None:
             return None
-        running = self._running_task_label()
-        if running:
-            return f"{running}正在运行，暂不能停用插件"
+        if plugin.is_running():
+            return f"{plugin.display_name}正在运行，暂时不能停用插件"
         removed_keys = set(self._plugin_page_keys.get(plugin_id, []))
         plugin.on_unload()
         if self._current_page in removed_keys:
@@ -3001,6 +3356,7 @@ class EdgeWorkbenchApp(ctk.CTk):
                 frame.destroy()
             self._remove_nav_item(key)
         self._plugin_page_keys.pop(plugin_id, None)
+        self._plugin_status.pop(plugin_id, None)
         manager.drop(plugin)
         self._purge_dead_buttons()
         return None
@@ -3089,9 +3445,9 @@ class EdgeWorkbenchApp(ctk.CTk):
     _TASK_COMMANDS = {
         "search_task": "搜索任务",
         "auto_run": "一键自动化",
-        "trigger_tasks": "触发未完成任务",
+        "trigger_tasks": "开始每日任务",
         "simulate": "模拟真实浏览",
-        "rewards_data": "获取全部数据",
+        "rewards_data": "刷新全部数据",
         "test_click": "测试点击",
     }
 
@@ -3104,7 +3460,7 @@ class EdgeWorkbenchApp(ctk.CTk):
             self._append_log(f"{running}正在运行，为避免中断任务已跳过「清理缓存」；请等任务结束，或用「停止浏览器」先停掉任务。", "warning")
             return
         self._disable_for("clean_cache")
-        self.busy_label.configure(text="正在清理可回收缓存…")
+        self._set_busy("正在清理可回收缓存…")
         self.worker.submit("clean_cache")
 
     def restart_browser(self) -> None:
@@ -3112,42 +3468,58 @@ class EdgeWorkbenchApp(ctk.CTk):
         if running:
             self._append_log(f"{running}正在运行，「重启浏览器」会先取消任务再重启。", "warning")
         self._disable_for("restart")
-        self.busy_label.configure(text="正在重启浏览器…")
+        self._set_busy("正在重启浏览器…")
         self.worker.submit("restart")
 
     def start_browser(self) -> None:
         self._disable_for("start")
-        self.busy_label.configure(text="正在启动…")
+        self._set_busy("正在启动…")
         self.worker.submit("start")
 
     def auto_run(self) -> None:
-        self.busy_label.configure(text="一键自动化：正在执行完整流程…")
+        self._set_busy("一键自动化：正在执行完整流程…")
         self.worker.submit("auto_run")
 
-    def _toggle_headless(self) -> None:
-        value = not self.worker.headless
+    def set_browser_window_visible(self, visible: bool) -> None:
+        """Set the shared browser-window mode used by the host and plugins."""
+        self._set_headless_mode(not bool(visible))
+
+    def _set_headless_mode(self, value: bool) -> None:
+        value = bool(value)
         self.worker.headless = value
-        button = self.headless_button
-        if value:
-            button.configure(fg_color=COLORS["accent"], hover_color=COLORS["accent_hover"], text_color="#ffffff")
-            self._append_log("隐藏模式已开启：浏览器启动时将在后台运行，自动化照常执行。", "info")
-        else:
-            button.configure(fg_color="#f2f2f0", hover_color="#e7e7e4", text_color=COLORS["text"])
-            self._append_log("隐藏模式已关闭：浏览器启动时将显示窗口。", "info")
+        for plugin in self.plugin_manager.plugins:
+            plugin.runtime.headless = value
+            sync = getattr(plugin, "sync_browser_window_visibility", None)
+            if callable(sync):
+                try:
+                    sync(not value)
+                except tk.TclError:
+                    pass
+
+        button = getattr(self, "headless_button", None)
+        if button is not None:
+            if value:
+                button.configure(fg_color=COLORS["accent"], hover_color=COLORS["accent_hover"], text_color="#ffffff")
+                self._append_log("隐藏模式已开启：浏览器启动时将在后台运行，自动化照常执行。", "info")
+            else:
+                button.configure(fg_color="#f2f2f0", hover_color="#e7e7e4", text_color=COLORS["text"])
+                self._append_log("隐藏模式已关闭：浏览器启动时将显示窗口。", "info")
+
         if self.worker.context is not None:
-            self._append_log("浏览器当前正在运行：切换需重启后生效，可点击「重启浏览器」立即应用。", "warning")
-            if self.worker.context is not None:
-                self._append_log("浏览器当前正在运行：切换需重启后生效，可点击「重启浏览器」立即应用。", "warning")
+            self._append_log("浏览器当前正在运行；切换需重启后生效，可点击「重启浏览器」立即应用。", "warning")
+
+    def _toggle_headless(self) -> None:
+        self._set_headless_mode(not self.worker.headless)
 
     def _apply_auto_status(self, event: dict[str, Any]) -> None:
         state = str(event.get("state") or "")
         message = str(event.get("message") or "")
         if state == "started":
-            self.busy_label.configure(text="一键自动化：正在执行…")
+            self._set_busy("一键自动化：正在执行…")
         elif state == "running":
-            self.busy_label.configure(text=message)
+            self._set_busy(message)
         elif state in {"done", "cancelled", "error"}:
-            self.busy_label.configure(text="")
+            self._set_busy("")
             if state == "done":
                 self._append_log("一键自动化全部完成。", "success")
             elif state == "cancelled":
@@ -3159,7 +3531,7 @@ class EdgeWorkbenchApp(ctk.CTk):
 
     def bing_search(self) -> None:
         self._disable_for("bing_search")
-        self.busy_label.configure(text="正在必应搜索…")
+        self._set_busy("正在必应搜索…")
         self.worker.submit("bing_search", query=self._url_var.get())
 
     def new_tab(self) -> None:
@@ -3168,7 +3540,7 @@ class EdgeWorkbenchApp(ctk.CTk):
 
     def simulate(self) -> None:
         self._disable_for("simulate")
-        self.busy_label.configure(text="正在模拟真实浏览…")
+        self._set_busy("正在模拟真实浏览…")
         self.worker.submit("simulate")
 
     def stop_browser_and_task(self) -> None:
@@ -3181,18 +3553,22 @@ class EdgeWorkbenchApp(ctk.CTk):
         self.worker.submit("snapshot")
 
     def _set_status(self, state: str, detail: str = "") -> None:
+        status_dot = getattr(self, "status_dot", None)
         if state == "running":
             self._status_var.set("运行中")
-            self.status_dot.configure(text_color=COLORS["success"])
-            self.busy_label.configure(text="")
+            if status_dot is not None:
+                status_dot.configure(text_color=COLORS["success"])
+            self._set_busy("")
         elif state == "starting":
             self._status_var.set("启动中")
-            self.status_dot.configure(text_color=COLORS["warning"])
-            self.busy_label.configure(text=detail or "正在启动…")
+            if status_dot is not None:
+                status_dot.configure(text_color=COLORS["warning"])
+            self._set_busy(detail or "正在启动…")
         else:
             self._status_var.set("未运行")
-            self.status_dot.configure(text_color=COLORS["muted"])
-            self.busy_label.configure(text="")
+            if status_dot is not None:
+                status_dot.configure(text_color=COLORS["muted"])
+            self._set_busy("")
         if detail:
             self._status_detail_var.set(detail)
 
@@ -3210,43 +3586,111 @@ class EdgeWorkbenchApp(ctk.CTk):
             profile_text = "…" + profile_text[-19:]
         self._metric_labels["profile_dir"].configure(text=profile_text)
 
+    def _handle_event(self, event: dict[str, Any]) -> None:
+        event_type = str(event.get("type") or "")
+        plugin_id = str(event.get("plugin_id") or "")
+
+        if event_type == "log":
+            self._append_log(str(event.get("message", "")), str(event.get("level", "info")))
+            return
+
+        if event_type == "plugin_process_error":
+            message = str(event.get("message") or "插件进程异常")
+            if plugin_id:
+                self._set_plugin_status(plugin_id, "error", "异常", message)
+            self._append_log(message, "error")
+            if plugin_id:
+                self.plugin_manager.dispatch(event, plugin_id)
+            return
+
+        if event_type in {"auto_status", "search_task_status"} and plugin_id:
+            state = str(event.get("state") or "")
+            message = str(event.get("message") or "")
+            if event_type == "auto_status":
+                if state in {"started", "running"}:
+                    self._set_plugin_status(plugin_id, "running", "运行中", message)
+                elif state == "done":
+                    self._set_plugin_status(plugin_id, "done", "已完成", message)
+                elif state == "cancelled":
+                    self._set_plugin_status(plugin_id, "cancelled", "已取消", message)
+                elif state == "error":
+                    self._set_plugin_status(plugin_id, "error", "异常", message)
+            else:
+                if state in {"planning", "planned", "news", "searching", "waiting", "scanning", "syncing"}:
+                    self._set_plugin_status(plugin_id, "running", "运行中", message)
+                elif state == "done":
+                    self._set_plugin_status(plugin_id, "done", "已完成", message)
+                elif state == "cancelled":
+                    self._set_plugin_status(plugin_id, "cancelled", "已取消", message)
+                elif state == "error":
+                    self._set_plugin_status(plugin_id, "error", "异常", message)
+            self.plugin_manager.dispatch(event, plugin_id)
+            return
+
+        if event_type == "status" and plugin_id:
+            state = str(event.get("state") or "")
+            detail = str(event.get("detail") or "")
+            if state == "starting":
+                self._set_plugin_status(plugin_id, "starting", "启动中", detail)
+            elif state == "running":
+                self._set_plugin_status(plugin_id, "running", "运行中", detail)
+            elif state == "stopped":
+                self._set_plugin_status(plugin_id, "stopped", "未启动", detail)
+            self.plugin_manager.dispatch(event, plugin_id)
+            return
+
+        if event_type == "command_done":
+            command = str(event.get("command") or "")
+            for button in self._command_buttons.get(command, []):
+                try:
+                    button.configure(state="normal")
+                except tk.TclError:
+                    pass
+            if plugin_id:
+                current = self._plugin_status.get(plugin_id, {}).get("state", "")
+                if current not in {"done", "cancelled", "error"}:
+                    if command == "stop":
+                        self._set_plugin_status(plugin_id, "stopped", "未启动")
+                    elif current == "running":
+                        self._set_plugin_status(plugin_id, "ready", "就绪")
+                self.plugin_manager.dispatch(event, plugin_id)
+            return
+
+        if event_type == "status":
+            self._set_status(str(event.get("state", "stopped")), str(event.get("detail", "")))
+        elif event_type == "stats" and not plugin_id:
+            self._apply_stats(event.get("data", {}))
+            self._last_stats_refresh = time.time()
+        elif event_type == "url" and not plugin_id:
+            url = str(event.get("url", ""))
+            if url and url != "about:blank":
+                self._url_var.set(url)
+        elif event_type == "page_count" and not plugin_id:
+            self._metric_labels["page_count"].configure(text=str(event.get("count", 0)))
+        elif event_type == "snapshot_saved" and not plugin_id:
+            self._append_log(f"快照路径: {event.get('path')}", "success")
+        elif event_type == "auto_status":
+            self._apply_auto_status(event)
+            self.plugin_manager.dispatch(event)
+        elif event_type in PluginManager.PLUGIN_EVENT_TYPES:
+            self.plugin_manager.dispatch(event, plugin_id or None)
+        elif event_type == "focus_ui" and not plugin_id:
+            self._bring_to_front()
+
     def _poll_events(self) -> None:
         if self._closing:
             return
         try:
             while True:
-                event = self.events.get_nowait()
-                event_type = event.get("type")
-                if event_type == "log":
-                    self._append_log(str(event.get("message", "")), str(event.get("level", "info")))
-                elif event_type == "status":
-                    self._set_status(str(event.get("state", "stopped")), str(event.get("detail", "")))
-                elif event_type == "stats":
-                    self._apply_stats(event.get("data", {}))
-                    self._last_stats_refresh = time.time()
-                elif event_type == "url":
-                    url = str(event.get("url", ""))
-                    if url and url != "about:blank":
-                        self._url_var.set(url)
-                elif event_type == "page_count":
-                    self._metric_labels["page_count"].configure(text=str(event.get("count", 0)))
-                elif event_type == "snapshot_saved":
-                    self._append_log(f"快照路径: {event.get('path')}", "success")
-                elif event_type == "auto_status":
-                    self._apply_auto_status(event)
-                    self.plugin_manager.dispatch(event)
-                elif event_type in PluginManager.PLUGIN_EVENT_TYPES:
-                    self.plugin_manager.dispatch(event)
-                elif event_type == "command_done":
-                    for button in self._command_buttons.get(str(event.get("command") or ""), []):
-                        try:
-                            button.configure(state="normal")
-                        except tk.TclError:
-                            pass  # 插件页可能已被热卸载
-                elif event_type == "focus_ui":
-                    self._bring_to_front()
+                self._handle_event(self.events.get_nowait())
         except queue.Empty:
             pass
+
+        for event in self.plugin_manager.poll_events():
+            try:
+                self._handle_event(event)
+            except Exception as exc:
+                self._append_log(f"插件事件处理失败: {exc}", "warning")
 
         if time.time() - self._last_stats_refresh > 25:
             self._last_stats_refresh = time.time()
@@ -3267,9 +3711,12 @@ class EdgeWorkbenchApp(ctk.CTk):
         if self._closing:
             return
         self._closing = True
-        self.busy_label.configure(text="正在保存并退出…")
+        self._set_busy("正在保存并退出…")
         self.worker.cancel_search_task()
         self.worker.submit("shutdown")
+        for plugin in list(self.plugin_manager.plugins):
+            plugin.runtime.cancel()
+        threading.Thread(target=self.plugin_manager.shutdown_all, name="plugin-shutdown", daemon=True).start()
         self._close_deadline = time.time() + 4.0
         self.after(100, self._finish_close)
 
@@ -3303,7 +3750,10 @@ def main() -> int:
     enable_windows_dpi_awareness()
     app = EdgeWorkbenchApp()
     if args.autostart:
-        app.after(900, app.start_browser)
+        if app.plugin_manager.plugins:
+            app._append_log("检测到进程隔离插件：不自动启动全局浏览器，请在插件页启动独立浏览器。", "info")
+        else:
+            app.after(900, app.start_browser)
     app.mainloop()
     return 0
 

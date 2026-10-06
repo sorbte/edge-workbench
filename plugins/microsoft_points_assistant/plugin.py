@@ -2,7 +2,7 @@
 
 由宿主的「Rewards」与「账户与规则」两页合并而来的单个插件页面，合并时去掉了重复内容：
 - 一键自动化入口（原侧栏「一键自动运行」按钮）变为页头最左的「▶ 启动」按钮；
-- 数据操作图标（获取全部数据 / 清理缓存 / 打开 JSON / 测试点击）原先两页各有一组，只保留页头一组；
+- 数据操作图标（刷新全部数据 / 清理缓存 / 打开 JSON / 测试点击）原先两页各有一组，只保留页头一组；
 - 两个页面各有一个完全相同的空状态引导，只保留一个；
 - 账户文本行中的「可用积分」与数据摘要中的「账户积分」是同一数据，只保留摘要里的；
 - 账户文本行中的积分规则摘要与「SEARCH RULES」网格重复，只保留网格。
@@ -24,8 +24,7 @@ from edge_workbench import (
     ICON_OPEN_FILE,
     ICON_REFRESH,
     ICON_TEST_CLICK,
-    REWARDS_ACCOUNT_FILE,
-    REWARDS_DATA_FILE,
+    ICON_WINDOW,
     WorkbenchPlugin,
     mono_font,
     now_text,
@@ -42,13 +41,19 @@ class MicrosoftPointsAssistantPlugin(WorkbenchPlugin):
         self._rewards_ok = False
         self._account_ok = False
         self._auto_running_ui = False
-        self._summary_var = tk.StringVar(value="尚未获取 Rewards 数据；点击「获取全部数据」开始。")
-        self._status_var = tk.StringVar(value=f"数据文件: {REWARDS_DATA_FILE}")
+        self._summary_var = tk.StringVar(value="尚未获取 Rewards 数据；点击「刷新全部数据」开始。")
+        self._status_var = tk.StringVar(value=f"数据文件: {self.rewards_data_file.name}")
         self._account_line_var = tk.StringVar(value="账户信息：尚未获取")
         self._search_task_var = tk.StringVar(value="搜索任务未启动")
         self._daily_task_var = tk.StringVar(value="每日任务未启动")
         self._empty_reason_var = tk.StringVar(value="尚未获取数据。请启动浏览器并登录 Microsoft 账号。")
         self._rule_labels: dict[str, ctk.CTkLabel] = {}
+        self._runtime_state_var = tk.StringVar(value="未启动")
+        self._runtime_detail_var = tk.StringVar(value="独立进程尚未启动；启动后使用专用 Edge 资料目录。")
+        self._runtime_process_var = tk.StringVar(value="进程: 未启动")
+        self._profile_label_var = tk.StringVar(value=f"资料: {self.profile_dir.name}")
+        self._browser_window_visible = not self.runtime.headless
+        self._browser_running = False
 
         page = ctk.CTkFrame(parent, fg_color="transparent", corner_radius=0)
         self._build_header(page)
@@ -64,27 +69,88 @@ class MicrosoftPointsAssistantPlugin(WorkbenchPlugin):
 
     def _build_header(self, page: Any) -> None:
         header = ctk.CTkFrame(page, fg_color="transparent")
-        header.pack(fill="x", padx=24, pady=(20, 12))
-        # 先占住右侧再排标题：数据操作图标与标题同一行，整页只此一组操作入口
-        toolbar = ctk.CTkFrame(header, fg_color="transparent")
-        toolbar.pack(side="right")
-        title_block = ctk.CTkFrame(header, fg_color="transparent")
-        title_block.pack(side="left", anchor="n")
-        ctk.CTkLabel(title_block, text="微软积分助手", text_color=COLORS["text"], font=sans_font(20, "bold")).pack(anchor="w")
-        ctk.CTkLabel(title_block, text="Microsoft Rewards 积分、账户规则与任务中心", text_color=COLORS["muted"], font=sans_font(11)).pack(anchor="w", pady=(4, 0))
+        header.pack(fill="x", padx=24, pady=(18, 10))
 
-        self.auto_run_button = self.app._button(toolbar, "▶  启动", self.start_auto_run, "primary", 96)
-        self.auto_run_button.pack(side="left", padx=(0, 10))
-        self.fetch_button = self.app._icon_button(toolbar, ICON_REFRESH, self.fetch_rewards_data, "获取全部数据")
+        title_row = ctk.CTkFrame(header, fg_color="transparent")
+        title_row.pack(fill="x")
+        title_cluster = ctk.CTkFrame(title_row, fg_color="transparent")
+        title_cluster.pack(side="left", fill="x", expand=True)
+        ctk.CTkLabel(title_cluster, text="微软积分助手", text_color=COLORS["text"], font=sans_font(20, "bold")).pack(side="left")
+        status_inline = ctk.CTkFrame(title_cluster, fg_color="transparent")
+        status_inline.pack(side="left", padx=(10, 0), pady=(2, 0))
+        self._runtime_dot = ctk.CTkLabel(status_inline, text="●", text_color=COLORS["muted"], font=("Segoe UI", 12))
+        self._runtime_dot.pack(side="left", padx=(0, 5))
+        self._runtime_state_label = ctk.CTkLabel(status_inline, textvariable=self._runtime_state_var, text_color=COLORS["muted"], font=sans_font(11, "bold"))
+        self._runtime_state_label.pack(side="left")
+
+        ctk.CTkLabel(
+            title_row,
+            text="Microsoft Rewards 积分、账户规则与任务中心",
+            text_color=COLORS["muted"],
+            font=sans_font(11),
+        ).pack(side="right", padx=(16, 0), pady=(7, 0))
+
+        meta_row = ctk.CTkFrame(header, fg_color="transparent")
+        meta_row.pack(fill="x", pady=(5, 0))
+        meta_row.grid_columnconfigure(0, weight=1)
+        meta_left = ctk.CTkFrame(meta_row, fg_color="transparent")
+        meta_left.grid(row=0, column=0, sticky="ew")
+        ctk.CTkLabel(
+            meta_left,
+            textvariable=self._runtime_process_var,
+            text_color=COLORS["muted"],
+            font=sans_font(10),
+            anchor="w",
+        ).pack(side="left")
+        self._profile_button = ctk.CTkButton(
+            meta_left,
+            textvariable=self._profile_label_var,
+            command=self.open_profile_directory,
+            width=0,
+            height=20,
+            corner_radius=4,
+            fg_color="transparent",
+            hover_color="#ececea",
+            text_color=COLORS["accent"],
+            font=sans_font(10, "bold"),
+            anchor="w",
+        )
+        self._profile_button.pack(side="left", padx=(6, 0))
+        self.app._attach_tooltip(self._profile_button, "点击打开插件资料目录")
+        ctk.CTkLabel(
+            meta_row,
+            textvariable=self._runtime_detail_var,
+            text_color=COLORS["muted"],
+            font=sans_font(10),
+            anchor="e",
+        ).grid(row=0, column=1, sticky="e", padx=(16, 0))
+
+        # 操作栏独占一行，避免状态文本与按钮在窄窗口中互相覆盖。
+        action_card = ctk.CTkFrame(page, fg_color="transparent", corner_radius=0)
+        action_card.pack(fill="x", padx=24, pady=(0, 12))
+        self.browser_actions = ctk.CTkFrame(action_card, fg_color="transparent")
+        self.browser_actions.pack(side="left", pady=10)
+
+        self.auto_run_button = self.app._button(self.browser_actions, "▶  启动", self.start_auto_run, "primary", 96)
+        self.auto_run_button.pack(side="left")
+
+        data_actions = ctk.CTkFrame(action_card, fg_color="transparent")
+        data_actions.pack(side="right", pady=10)
+        self.toolbar = data_actions
+        self.fetch_button = self.app._icon_button(data_actions, ICON_REFRESH, self.fetch_rewards_data, "刷新全部数据")
         self.fetch_button.pack(side="left", padx=(0, 6))
-        self.clear_cache_button = self.app._icon_button(toolbar, ICON_CLEAN, self.clear_rewards_cache, "清理 Rewards 缓存（任务运行中会跳过）")
+        self.clear_cache_button = self.app._icon_button(data_actions, ICON_CLEAN, self.clear_rewards_cache, "清理 Rewards 缓存（任务运行中会跳过）")
         self.clear_cache_button.pack(side="left", padx=(0, 6))
-        self.open_json_button = self.app._icon_button(toolbar, ICON_OPEN_FILE, self.open_rewards_data_file, "打开数据 JSON")
+        self.open_json_button = self.app._icon_button(data_actions, ICON_OPEN_FILE, self.open_rewards_data_file, "打开数据 JSON")
         self.open_json_button.pack(side="left", padx=(0, 6))
-        self.test_click_button = self.app._icon_button(toolbar, ICON_TEST_CLICK, self.test_click, "测试点击")
-        self.test_click_button.pack(side="left")
+        self.test_click_button = self.app._icon_button(data_actions, ICON_TEST_CLICK, self.test_click, "测试点击")
+        self.test_click_button.pack(side="left", padx=(0, 6))
+        self.browser_window_button = self.app._icon_button(data_actions, ICON_WINDOW, self.toggle_browser_window, "切换独立 Edge 窗口显示（黑色=后台运行）")
+        self.browser_window_button.pack(side="left")
+        self._sync_browser_window_button()
         self.app._bind_busy("rewards_data", self.fetch_button, self.clear_cache_button)
         self.app._bind_busy("test_click", self.test_click_button)
+        self.app._bind_busy("auto_run", self.auto_run_button)
 
     def _build_empty_state(self, body: Any) -> None:
         self.empty_frame = ctk.CTkFrame(body, fg_color="transparent", corner_radius=0)
@@ -97,7 +163,7 @@ class MicrosoftPointsAssistantPlugin(WorkbenchPlugin):
         ctk.CTkLabel(empty_center, text="暂无 Rewards 数据", text_color=COLORS["text"], font=sans_font(15, "bold")).pack(pady=(14, 8))
         ctk.CTkLabel(empty_center, textvariable=self._empty_reason_var, justify="center", wraplength=560, text_color=COLORS["muted"], font=sans_font(11)).pack()
         ctk.CTkLabel(empty_center, text="登录完成后点击下方按钮重新获取", text_color=COLORS["muted"], font=sans_font(10)).pack(pady=(10, 16))
-        empty_fetch_button = self.app._button(empty_center, "获取全部数据", self.fetch_rewards_data, "primary", 130)
+        empty_fetch_button = self.app._button(empty_center, "刷新全部数据", self.fetch_rewards_data, "primary", 130)
         empty_fetch_button.pack()
         self.app._bind_busy("rewards_data", empty_fetch_button)
 
@@ -110,13 +176,30 @@ class MicrosoftPointsAssistantPlugin(WorkbenchPlugin):
             scrollbar_button_hover_color="#d6d6d2",
         )
         self.data_frame.grid(row=0, column=0, sticky="nsew")
+        scrollbar = getattr(self.data_frame, "_scrollbar", None)
+        if scrollbar is not None:
+            # 保留鼠标滚轮滚动，但不再显示右侧滚动条。
+            scrollbar.grid_remove()
         self.data_frame.grid_remove()
 
         summary_card = self.app._card(self.data_frame, padded=True)
         self.app._section_label(summary_card, "ACCOUNT / 账户与数据摘要", top=12)
         ctk.CTkLabel(summary_card, textvariable=self._account_line_var, justify="left", anchor="w", wraplength=900, text_color=COLORS["text"], font=sans_font(11)).pack(fill="x", padx=16)
         ctk.CTkLabel(summary_card, textvariable=self._summary_var, justify="left", anchor="w", wraplength=900, text_color=COLORS["text"], font=sans_font(11)).pack(fill="x", padx=16, pady=(6, 4))
-        ctk.CTkLabel(summary_card, textvariable=self._status_var, justify="left", anchor="w", wraplength=900, text_color=COLORS["muted"], font=mono_font(10)).pack(fill="x", padx=16, pady=(0, 14))
+        self._data_file_button = ctk.CTkButton(
+            summary_card,
+            textvariable=self._status_var,
+            command=self.open_rewards_data_file,
+            height=24,
+            corner_radius=4,
+            fg_color="transparent",
+            hover_color="#f2f2f0",
+            text_color=COLORS["muted"],
+            font=sans_font(11),
+            anchor="w",
+        )
+        self._data_file_button.pack(fill="x", padx=10, pady=(0, 8))
+        self.app._attach_tooltip(self._data_file_button, "点击打开数据 JSON")
 
         search_card = self.app._card(self.data_frame, padded=True)
         self.app._section_label(search_card, "SEARCH TASK / 搜索任务", top=12)
@@ -140,13 +223,13 @@ class MicrosoftPointsAssistantPlugin(WorkbenchPlugin):
         self.daily_progress.set(0)
         daily_row = ctk.CTkFrame(daily_card, fg_color="transparent")
         daily_row.pack(fill="x", padx=14, pady=(0, 14))
-        self.daily_trigger_button = self.app._button(daily_row, "触发未完成任务", self.trigger_incomplete_tasks, "primary", 135)
+        self.daily_trigger_button = self.app._button(daily_row, "开始每日任务", self.trigger_incomplete_tasks, "primary", 135)
         self.daily_trigger_button.pack(side="left")
         self.daily_cancel_button = self.app._button(daily_row, "取消任务", self.cancel_daily_task, "danger", 100)
         self.daily_cancel_button.configure(state="disabled")
         self.daily_cancel_button.pack(side="left", padx=(8, 0))
 
-        ctk.CTkLabel(self.data_frame, text="SEARCH RULES / 积分规则", text_color=COLORS["muted"], font=mono_font(10, "bold"), anchor="w").pack(fill="x", padx=24, pady=(6, 0))
+        ctk.CTkLabel(self.data_frame, text="SEARCH RULES / 积分规则", text_color=COLORS["muted"], font=sans_font(11, "bold"), anchor="w").pack(fill="x", padx=24, pady=(6, 0))
         rules = ctk.CTkFrame(self.data_frame, fg_color="transparent")
         rules.pack(fill="x", padx=18, pady=(4, 16))
         for column in range(4):
@@ -171,14 +254,85 @@ class MicrosoftPointsAssistantPlugin(WorkbenchPlugin):
 
     # ------------------------------------------------------------------ 状态切换
 
+    def _sync_browser_window_button(self) -> None:
+        button = getattr(self, "browser_window_button", None)
+        if button is None:
+            return
+        button.configure(text=ICON_WINDOW)
+        if self._browser_window_visible:
+            button.configure(
+                fg_color="#f2f2f0",
+                hover_color="#e7e7e4",
+                text_color=COLORS["text"],
+            )
+        else:
+            button.configure(
+                fg_color=COLORS["accent"],
+                hover_color=COLORS["accent_hover"],
+                text_color="#ffffff",
+            )
+
+    def sync_browser_window_visibility(self, visible: bool) -> None:
+        """与总览页的浏览器窗口显示设置保持同步。"""
+        self._browser_window_visible = bool(visible)
+        self._sync_browser_window_button()
+
+    def toggle_browser_window(self) -> None:
+        """独立切换启动时是否显示 Edge 窗口；当前页面不因此中断。"""
+        visible = not self._browser_window_visible
+        self.app.set_browser_window_visible(visible)
+        if self._browser_running:
+            self._runtime_detail_var.set("窗口显示设置已更新；重启独立浏览器后生效。")
+            self.log("浏览器正在运行，窗口显示设置将在重启独立浏览器后生效。", "warning")
+
+    def _set_runtime_state(self, state: str, detail: str = "") -> None:
+        """Update this plugin's own runtime indicator inside its page."""
+        mapping = {
+            "idle": ("未启动", COLORS["muted"]),
+            "stopped": ("未启动", COLORS["muted"]),
+            "starting": ("启动中", COLORS["warning"]),
+            "running": ("运行中", COLORS["success"]),
+            "ready": ("就绪", COLORS["accent"]),
+            "done": ("已完成", COLORS["success"]),
+            "cancelling": ("取消中", COLORS["warning"]),
+            "cancelled": ("已取消", COLORS["warning"]),
+            "error": ("异常", COLORS["danger"]),
+        }
+        label, color = mapping.get(str(state), ("运行中", COLORS["success"]))
+        try:
+            self._runtime_state_var.set(label)
+            self._runtime_dot.configure(text_color=color)
+            self._runtime_state_label.configure(text_color=color)
+            if detail:
+                self._runtime_detail_var.set(detail)
+            pid = self.runtime.process_id
+            self._runtime_process_var.set(f"进程: {pid or '未启动'}")
+            self._profile_label_var.set(f"资料: {self.profile_dir.name}")
+        except tk.TclError:
+            pass
+
+    def _set_toolbar_visible(self, visible: bool) -> None:
+        toolbar = getattr(self, "toolbar", None)
+        browser_actions = getattr(self, "browser_actions", None)
+        if toolbar is None or browser_actions is None:
+            return
+        if visible:
+            browser_actions.pack(side="left", pady=10)
+            toolbar.pack(side="right", pady=10)
+        else:
+            toolbar.pack_forget()
+            browser_actions.pack_forget()
+
     def _show_state(self, state: str) -> None:
         """在空状态与数据态之间切换。"""
         if state == "empty":
             self.empty_frame.grid()
             self.data_frame.grid_remove()
+            self._set_toolbar_visible(False)
         else:
             self.data_frame.grid()
             self.empty_frame.grid_remove()
+            self._set_toolbar_visible(True)
 
     def _refresh_state(self) -> None:
         self._show_state("data" if (self._rewards_ok or self._account_ok) else "empty")
@@ -186,8 +340,8 @@ class MicrosoftPointsAssistantPlugin(WorkbenchPlugin):
     # ------------------------------------------------------------------ 热更新
 
     def on_unload(self) -> None:
-        """被热卸载前调用：让尚未触发的 after 回调（如缓存加载）自动跳过。"""
-        self._active = False
+        """Stop page callbacks and the isolated plugin process."""
+        super().on_unload()
 
     def handle_event(self, event: dict[str, Any]) -> None:
         if not self._active:
@@ -203,21 +357,60 @@ class MicrosoftPointsAssistantPlugin(WorkbenchPlugin):
             self._apply_search_task_status(event)
         elif event_type == "auto_status":
             self._apply_auto_status(event)
+        elif event_type == "status":
+            state = str(event.get("state") or "")
+            detail = str(event.get("detail") or "")
+            if state == "starting":
+                self._set_runtime_state("starting", detail)
+            elif state == "running":
+                self._browser_running = True
+                self._set_runtime_state("ready", detail)
+            elif state == "stopped":
+                self._browser_running = False
+                self._set_runtime_state("stopped", detail)
+        elif event_type == "command_done":
+            command = str(event.get("command") or "")
+            if not self._auto_running_ui:
+                if command == "stop":
+                    self._set_runtime_state("stopped", "独立浏览器已停止。")
+                else:
+                    self._set_runtime_state("ready", f"命令已完成: {command}")
+        elif event_type == "plugin_process_error":
+            self._set_runtime_state("error", str(event.get("message") or "插件进程异常"))
 
     def _apply_auto_status(self, event: dict[str, Any]) -> None:
         state = str(event.get("state") or "")
-        if state == "started":
+        message = str(event.get("message") or "")
+        if state in {"started", "running"}:
             self._auto_running_ui = True
             self.auto_run_button.configure(state="disabled")
-            for button in (self.search_start_button, self.daily_trigger_button, self.fetch_button, self.test_click_button):
+            for button in (self.search_start_button, self.daily_trigger_button, self.fetch_button, self.clear_cache_button, self.test_click_button):
                 button.configure(state="disabled")
-        elif state in {"done", "cancelled", "error"}:
+            self._set_runtime_state("running", message or "一键自动化运行中。")
+        elif state == "done":
             self._auto_running_ui = False
             self.auto_run_button.configure(state="normal")
-            for button in (self.search_start_button, self.daily_trigger_button, self.fetch_button, self.test_click_button):
+            for button in (self.search_start_button, self.daily_trigger_button, self.fetch_button, self.clear_cache_button, self.test_click_button):
                 button.configure(state="normal")
             self.search_cancel_button.configure(state="disabled")
             self.daily_cancel_button.configure(state="disabled")
+            self._set_runtime_state("done", message or "一键自动化全部完成。")
+        elif state == "cancelled":
+            self._auto_running_ui = False
+            self.auto_run_button.configure(state="normal")
+            for button in (self.search_start_button, self.daily_trigger_button, self.fetch_button, self.clear_cache_button, self.test_click_button):
+                button.configure(state="normal")
+            self.search_cancel_button.configure(state="disabled")
+            self.daily_cancel_button.configure(state="disabled")
+            self._set_runtime_state("cancelled", message or "一键自动化已取消。")
+        elif state == "error":
+            self._auto_running_ui = False
+            self.auto_run_button.configure(state="normal")
+            for button in (self.search_start_button, self.daily_trigger_button, self.fetch_button, self.clear_cache_button, self.test_click_button):
+                button.configure(state="normal")
+            self.search_cancel_button.configure(state="disabled")
+            self.daily_cancel_button.configure(state="disabled")
+            self._set_runtime_state("error", message or "一键自动化失败。")
 
     def _apply_search_task_status(self, event: dict[str, Any]) -> None:
         flow = str(event.get("flow") or "search")
@@ -243,8 +436,15 @@ class MicrosoftPointsAssistantPlugin(WorkbenchPlugin):
             if not self._auto_running_ui:
                 self.daily_trigger_button.configure(state="disabled" if running else "normal")
             self.daily_cancel_button.configure(state="normal" if running else "disabled")
-        if state in {"done", "cancelled", "error", "planned", "syncing"}:
-            self.app.busy_label.configure(text="")
+        if state in {"planning", "planned", "news", "searching", "waiting", "scanning", "syncing"}:
+            self._set_runtime_state("running", message)
+        elif state == "done":
+            if not self._auto_running_ui:
+                self._set_runtime_state("done", message)
+        elif state == "cancelled":
+            self._set_runtime_state("cancelled", message)
+        elif state == "error":
+            self._set_runtime_state("error", message)
 
     @staticmethod
     def _set_flow_progress(bar: Any, event: dict[str, Any], state: str) -> None:
@@ -260,17 +460,18 @@ class MicrosoftPointsAssistantPlugin(WorkbenchPlugin):
         message = str(event.get("message") or "")
         if state == "loading":
             self._account_line_var.set(message or "正在获取账户信息…")
+            self._set_runtime_state("running", message or "正在获取账户信息与积分规则。")
             if not (self._rewards_ok or self._account_ok):
                 self._show_state("empty")
                 self._empty_reason_var.set(message or "正在获取账户信息与积分规则…")
         elif state == "error":
-            self.app.busy_label.configure(text="")
+            self._set_runtime_state("error", message or "获取账户信息失败。")
             if not (self._rewards_ok or self._account_ok):
                 self._show_state("empty")
                 self._empty_reason_var.set(message or "获取账户信息失败，请重试。")
             self.log(message or "获取账户信息失败。", "warning")
         elif state == "done":
-            self.app.busy_label.configure(text="")
+            self._set_runtime_state("done", "账户信息与积分规则获取完成。")
 
     def _apply_rewards_data(self, data: dict[str, Any]) -> None:
         login_required = bool(data.get("login_required"))
@@ -281,7 +482,7 @@ class MicrosoftPointsAssistantPlugin(WorkbenchPlugin):
         if login_required or not has_payload:
             # 未登录 / 数据无法识别：切到空状态并给出原因与下一步指引
             self._rewards_ok = False
-            self._summary_var.set("Rewards 数据未能识别；点击「获取全部数据」重新获取。")
+            self._summary_var.set("Rewards 数据未能识别；点击「刷新全部数据」重新获取。")
             if login_required:
                 reason = "未检测到登录状态：请先在 Edge 中登录 Microsoft 账号后重新获取。"
                 if self.worker.headless:
@@ -319,7 +520,7 @@ class MicrosoftPointsAssistantPlugin(WorkbenchPlugin):
             summary += "\n未识别到带积分的日常任务（无积分选项已自动排除）。"
         self._summary_var.set(summary)
         fetched_at = data.get("fetched_at") or now_text()
-        self._status_var.set(f"最近更新: {fetched_at}  ·  文件: {REWARDS_DATA_FILE}")
+        self._status_var.set(f"最近更新: {fetched_at}  ·  文件: {self.rewards_data_file.name}")
         self.log("Rewards 基本数据面板已更新。", "success")
         self._refresh_state()
 
@@ -359,61 +560,68 @@ class MicrosoftPointsAssistantPlugin(WorkbenchPlugin):
     # ------------------------------------------------------------------ 动作
 
     def start_auto_run(self) -> None:
-        """一键自动化入口：启动浏览器（如未运行）并执行完整任务流程。"""
+        """一键自动化入口：在本插件自己的独立进程中启动浏览器并执行完整流程。"""
         self.auto_run_button.configure(state="disabled")
-        self.app.auto_run()
+        self._set_runtime_state("starting", "已提交一键自动化任务，正在启动独立浏览器进程。")
+        self.submit("auto_run")
 
     def fetch_rewards_data(self) -> None:
         self.app._disable_for("rewards_data")
-        self.app.busy_label.configure(text="正在获取 Rewards 数据与账户规则…")
+        self._set_runtime_state("running", "正在获取 Rewards 数据与账户规则。")
         self._status_var.set("正在读取 Rewards 页面…")
         self._account_line_var.set("正在读取账户信息与积分规则…")
-        self.worker.submit("rewards_data")
+        self.submit("rewards_data")
 
     def test_click(self) -> None:
         self.app._disable_for("test_click")
-        self.app.busy_label.configure(text="正在执行测试点击…")
+        self._set_runtime_state("running", "正在执行测试点击。")
         self._status_var.set("测试点击中：优先打开今日积分抽屉…")
-        self.worker.submit("test_click")
+        self.submit("test_click")
 
     def start_search_task(self) -> None:
         self.search_start_button.configure(state="disabled")
         self.search_cancel_button.configure(state="normal")
-        self.app.busy_label.configure(text="正在准备搜索任务…")
+        self._set_runtime_state("running", "正在准备搜索任务。")
         self._search_task_var.set("正在计算搜索计划…")
         self.search_progress.set(0)
-        self.worker.submit("search_task")
+        self.submit("search_task")
 
     def cancel_search_task(self) -> None:
         self.worker.cancel_search_task()
+        self._set_runtime_state("cancelling", "正在取消搜索任务。")
         self._search_task_var.set("正在取消搜索任务…")
 
     def cancel_daily_task(self) -> None:
         self.worker.cancel_search_task()
+        self._set_runtime_state("cancelling", "正在取消每日任务。")
         self._daily_task_var.set("正在取消每日任务…")
 
     def trigger_incomplete_tasks(self) -> None:
         self.daily_trigger_button.configure(state="disabled")
         self.daily_cancel_button.configure(state="normal")
-        self.app.busy_label.configure(text="正在触发未完成任务…")
-        self._daily_task_var.set("正在扫描日常任务 / 每日活动…")
+        self._set_runtime_state("running", "正在触发未完成的每日任务。")
+        self._daily_task_var.set("正在扫描每日任务 / 每日活动…")
         self.daily_progress.set(0)
-        self.worker.submit("trigger_tasks")
+        self.submit("trigger_tasks")
+
+    def open_profile_directory(self) -> None:
+        """打开当前插件的 Edge 资料目录。"""
+        self.profile_dir.mkdir(parents=True, exist_ok=True)
+        os.startfile(self.profile_dir)
 
     def open_rewards_data_file(self) -> None:
-        if not REWARDS_DATA_FILE.exists():
-            messagebox.showinfo("Rewards 数据", "还没有数据文件，请先点击「获取全部数据」。")
+        if not self.rewards_data_file.exists():
+            messagebox.showinfo("Rewards 数据", "还没有数据文件，请先点击「刷新全部数据」。")
             return
-        os.startfile(REWARDS_DATA_FILE)
+        os.startfile(self.rewards_data_file)
 
     def clear_rewards_cache(self) -> None:
-        """删除两份数据缓存文件，并把页面重置为空状态；任务运行期间跳过。"""
-        running = self.app._running_task_label()
-        if running:
-            self.log(f"{running}正在运行，为避免影响任务数据已跳过「清理 Rewards 缓存」；请等任务结束后重试。", "warning")
+        """删除插件自己的两份数据缓存；任务运行期间跳过。"""
+        if self.is_running():
+            self.log("插件任务正在运行，已跳过「清理 Rewards 缓存」；请等任务结束后重试。", "warning")
             return
         removed: list[str] = []
-        for path in (REWARDS_DATA_FILE, REWARDS_ACCOUNT_FILE):
+        for path in (self.rewards_data_file, self.rewards_account_file):
             try:
                 if path.exists():
                     path.unlink()
@@ -422,35 +630,34 @@ class MicrosoftPointsAssistantPlugin(WorkbenchPlugin):
                 self.log(f"无法删除缓存文件 {path.name}，可能正被占用。", "warning")
         self._rewards_ok = False
         self._account_ok = False
-        self._summary_var.set("尚未获取 Rewards 数据；点击「获取全部数据」开始。")
-        self._status_var.set(f"数据文件: {REWARDS_DATA_FILE}")
+        self._summary_var.set("尚未获取 Rewards 数据；点击「刷新全部数据」开始。")
+        self._status_var.set(f"数据文件: {self.rewards_data_file.name}")
         self._account_line_var.set("账户信息：尚未获取")
         self._empty_reason_var.set("缓存已清理。启动浏览器并登录 Microsoft 账号后可重新获取。")
         for label in self._rule_labels.values():
             label.configure(text="--")
         self._show_state("empty")
+        self._set_runtime_state("idle", "缓存已清理，插件进程未启动任务。")
         if removed:
             self.log(f"已清理 Rewards 缓存（{'、'.join(removed)}），页面已重置为空状态。", "success")
         else:
             self.log("没有可清理的 Rewards 缓存文件。")
 
-    # ------------------------------------------------------------------ 缓存与工具
-
     def _load_cached_data(self) -> None:
-        """启动/热装载时读取上次的缓存数据，先基本数据后账户规则。"""
+        """启动/热装载时读取本插件自己的缓存数据。"""
         if not self._active:
             return
-        if REWARDS_DATA_FILE.exists():
+        if self.rewards_data_file.exists():
             try:
-                payload = json.loads(REWARDS_DATA_FILE.read_text(encoding="utf-8"))
+                payload = json.loads(self.rewards_data_file.read_text(encoding="utf-8"))
                 data = payload.get("summary", payload)
                 if isinstance(data, dict) and data:
                     self._apply_rewards_data(data)
             except Exception:
                 pass
-        if REWARDS_ACCOUNT_FILE.exists():
+        if self.rewards_account_file.exists():
             try:
-                payload = json.loads(REWARDS_ACCOUNT_FILE.read_text(encoding="utf-8"))
+                payload = json.loads(self.rewards_account_file.read_text(encoding="utf-8"))
                 if isinstance(payload, dict) and payload:
                     self._apply_rewards_account(payload)
             except Exception:
