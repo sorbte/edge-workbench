@@ -5,6 +5,9 @@ import json
 import math
 import queue
 import random
+
+# 模拟人类行为的随机量统一使用安全随机源（SystemRandom 基于 os.urandom）
+_RAND = random.SystemRandom()
 import re
 import shutil
 import threading
@@ -883,7 +886,7 @@ class BrowserWorker(threading.Thread):
             box.fill("")
         except Exception:
             pass
-        page.keyboard.type(query, delay=random.randint(35, 110))
+        page.keyboard.type(query, delay=_RAND.randint(35, 110))
         page.keyboard.press("Enter")
         try:
             page.wait_for_load_state("domcontentloaded", timeout=15_000)
@@ -916,16 +919,16 @@ class BrowserWorker(threading.Thread):
         for index in range(1, steps + 1):
             t = index / steps
             eased = t * t * (3 - 2 * t)
-            current_x = start_x + (x - start_x) * eased + random.uniform(-2.5, 2.5)
-            current_y = start_y + (y - start_y) * eased + random.uniform(-2.5, 2.5)
+            current_x = start_x + (x - start_x) * eased + _RAND.uniform(-2.5, 2.5)
+            current_y = start_y + (y - start_y) * eased + _RAND.uniform(-2.5, 2.5)
             page.mouse.move(current_x, current_y)
-            page.wait_for_timeout(random.randint(8, 28))
+            page.wait_for_timeout(_RAND.randint(8, 28))
 
     def simulate_real_browsing(self) -> None:
         page = self._current_page()
         if "bing.com" not in page.url:
             self._goto_page(page, HOME_URL)
-        page.wait_for_timeout(random.randint(700, 1200))
+        page.wait_for_timeout(_RAND.randint(700, 1200))
 
         query = "Microsoft Edge 浏览器缓存"
         self.log("模拟真实用户操作：寻找搜索框 → 点击 → 逐字输入 → 回车 → 阅读滚动。")
@@ -936,10 +939,10 @@ class BrowserWorker(threading.Thread):
             search_box.wait_for(state="visible", timeout=15_000)
             box = search_box.bounding_box()
             if box:
-                target_x = int(box["x"] + box["width"] * random.uniform(0.15, 0.85))
-                target_y = int(box["y"] + box["height"] * random.uniform(0.25, 0.75))
+                target_x = int(box["x"] + box["width"] * _RAND.uniform(0.15, 0.85))
+                target_y = int(box["y"] + box["height"] * _RAND.uniform(0.25, 0.75))
                 self.spider_dash_to(page, box=box)
-                self._human_move(page, target_x, target_y, steps=random.randint(18, 30))
+                self._human_move(page, target_x, target_y, steps=_RAND.randint(18, 30))
                 page.mouse.click(target_x, target_y)
             else:
                 search_box.click()
@@ -949,8 +952,8 @@ class BrowserWorker(threading.Thread):
         if search_box.count():
             search_box.fill("")
         for character in query:
-            page.keyboard.type(character, delay=random.randint(45, 135))
-        page.wait_for_timeout(random.randint(250, 700))
+            page.keyboard.type(character, delay=_RAND.randint(45, 135))
+        page.wait_for_timeout(_RAND.randint(250, 700))
         page.keyboard.press("Enter")
         try:
             page.wait_for_load_state("domcontentloaded", timeout=30_000)
@@ -958,13 +961,13 @@ class BrowserWorker(threading.Thread):
         except PlaywrightTimeoutError:
             pass
 
-        page.wait_for_timeout(random.randint(700, 1400))
-        for _ in range(random.randint(3, 5)):
-            page.mouse.wheel(0, random.randint(320, 780))
-            page.wait_for_timeout(random.randint(450, 1050))
-            self._human_move(page, random.randint(180, 1100), random.randint(140, 650), steps=random.randint(8, 16))
-        page.mouse.wheel(0, -random.randint(1000, 1900))
-        page.wait_for_timeout(random.randint(700, 1200))
+        page.wait_for_timeout(_RAND.randint(700, 1400))
+        for _ in range(_RAND.randint(3, 5)):
+            page.mouse.wheel(0, _RAND.randint(320, 780))
+            page.wait_for_timeout(_RAND.randint(450, 1050))
+            self._human_move(page, _RAND.randint(180, 1100), _RAND.randint(140, 650), steps=_RAND.randint(8, 16))
+        page.mouse.wheel(0, -_RAND.randint(1000, 1900))
+        page.wait_for_timeout(_RAND.randint(700, 1200))
 
         try:
             title = page.title()
@@ -1440,8 +1443,8 @@ class BrowserWorker(threading.Thread):
                 pass
             news_page.wait_for_timeout(1200)
             for _ in range(6):
-                news_page.mouse.wheel(0, random.randint(700, 1200))
-                news_page.wait_for_timeout(random.randint(250, 550))
+                news_page.mouse.wheel(0, _RAND.randint(700, 1200))
+                news_page.wait_for_timeout(_RAND.randint(250, 550))
             items = news_page.evaluate(
                 r"""() => {
                     const clean = (value) => String(value || '').replace(/\s+/g, ' ').trim();
@@ -1460,7 +1463,7 @@ class BrowserWorker(threading.Thread):
             )
             if not isinstance(items, list):
                 items = []
-            random.shuffle(items)
+            _RAND.shuffle(items)
             selected = items[:count]
             cache_payload = {
                 "fetched_at": now_text(),
@@ -1487,14 +1490,14 @@ class BrowserWorker(threading.Thread):
             page.wait_for_load_state("networkidle", timeout=8_000)
         except PlaywrightTimeoutError:
             pass
-        page.wait_for_timeout(random.randint(1800, 3500))
+        page.wait_for_timeout(_RAND.randint(1800, 3500))
         # 蜘蛛联动：新闻搜索结果就是“获取到的信息”，蜘蛛爬过去接触采集
         self._apply_spider_overlay(page)
         self.spider_fetch_element(page, selector="#b_results")
-        for _ in range(random.randint(2, 4)):
-            page.mouse.wheel(0, random.randint(350, 900))
-            page.wait_for_timeout(random.randint(500, 1200))
-            self._human_move(page, random.randint(180, 1050), random.randint(160, 650), steps=random.randint(6, 12))
+        for _ in range(_RAND.randint(2, 4)):
+            page.mouse.wheel(0, _RAND.randint(350, 900))
+            page.wait_for_timeout(_RAND.randint(500, 1200))
+            self._human_move(page, _RAND.randint(180, 1050), _RAND.randint(160, 650), steps=_RAND.randint(6, 12))
         return query
 
     def _read_bing_total_points(self, page: Page) -> int | None:
@@ -1580,7 +1583,7 @@ class BrowserWorker(threading.Thread):
         latest: int | None = None
         for attempt in range(3):
             self._check_cancel()
-            page.wait_for_timeout(random.randint(4500, 6000) if attempt == 0 else random.randint(3500, 5500))
+            page.wait_for_timeout(_RAND.randint(4500, 6000) if attempt == 0 else _RAND.randint(3500, 5500))
             current = self._read_bing_total_points(page)
             if current is not None:
                 latest = current
@@ -1917,7 +1920,7 @@ class BrowserWorker(threading.Thread):
                     no_increase_count = 0
 
                 if index < total:
-                    wait_seconds = random.uniform(SEARCH_INTERVAL_MIN_SECONDS, SEARCH_INTERVAL_MAX_SECONDS)
+                    wait_seconds = _RAND.uniform(SEARCH_INTERVAL_MIN_SECONDS, SEARCH_INTERVAL_MAX_SECONDS)
                     self._wait_with_cancel(wait_seconds, message=f"随机等待 {wait_seconds:.0f} 秒后继续…")
 
             if stopped_due_to_no_increase:
@@ -2068,7 +2071,7 @@ class BrowserWorker(threading.Thread):
                         self._search_task_log({"event": "task_click_failed", "section": section_name, "title": title})
                         break
                     processed.add(title)
-                    page.wait_for_timeout(random.randint(2500, 4500))
+                    page.wait_for_timeout(_RAND.randint(2500, 4500))
                     new_pages = []
                     if self.context is not None:
                         for item in self.context.pages:
@@ -2137,7 +2140,7 @@ class BrowserWorker(threading.Thread):
                     if clicked_total >= 30:
                         self.log("达到单轮最多 30 次触发限制，停止继续点击。", "warning")
                         break
-                    if self._cancel_event.wait(random.uniform(6, 12)):
+                    if self._cancel_event.wait(_RAND.uniform(6, 12)):
                         raise TaskCancelled()
 
             self.emit(
