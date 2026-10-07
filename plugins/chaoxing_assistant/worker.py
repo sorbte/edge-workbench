@@ -1,4 +1,4 @@
-"""学习通助手 worker：同步个人空间用户信息与学历课程。"""
+"""学习通助手 worker：同步个人空间用户信息与在读课程（历史课程不采集）。"""
 
 from __future__ import annotations
 
@@ -16,10 +16,30 @@ _PLUGIN_DIR = Path(__file__).resolve().parent
 if str(_PLUGIN_DIR) not in sys.path:
     sys.path.insert(0, str(_PLUGIN_DIR))
 from study_automation import StudyAutomation
+from ai_homework import AIHomeworkAutomation
 
 
 PERSONAL_SPACE_URL = "http://i.mooc.jjxy.zufe.edu.cn/space/index?ws=1"
 LOGIN_WAIT_SECONDS = 300
+# 学习通登录 Cookie 的归属域；UID/_uid/vc3/cx_p_token/p_auth_token 等关键凭证
+# 是会话级（expires=-1），Chromium 关闭浏览器即删除，必须转为持久化才能跨重启保登录。
+AUTH_COOKIE_DOMAIN_SUFFIXES = ("zufe.edu.cn", "chaoxing.com")
+AUTH_COOKIE_PERSIST_DAYS = 180
+AUTH_COOKIE_FIELDS = {"name", "value", "url", "domain", "path", "expires", "httpOnly", "secure", "sameSite"}
+
+
+def course_is_done(course: dict[str, Any]) -> bool:
+    """课程是否已学完：优先看整体进度，缺进度时看任务点/测验是否全部完成。"""
+    progress = course.get("overall_progress")
+    if isinstance(progress, (int, float)):
+        return float(progress) >= 99.9
+    checks: list[bool] = []
+    for current_key, total_key in (("task_current", "task_total"), ("quiz_current", "quiz_total")):
+        current = course.get(current_key)
+        total = course.get(total_key)
+        if isinstance(current, (int, float)) and isinstance(total, (int, float)):
+            checks.append(float(current) >= float(total))
+    return bool(checks) and all(checks)
 
 
 PROFILE_EXTRACTION_SCRIPT = r"""
@@ -131,15 +151,42 @@ class ChaoxingAssistantWorker:
         self.profile_file = self.runtime_dir / "profile.json"
         self.courses_file = self.runtime_dir / "courses.json"
         self.auth_file = self.runtime_dir / "auth_state.json"
+        self.ai_settings_file = self.runtime_dir / "ai_settings.json"
+        self.ai_menu_enabled = self._read_menu_enabled()
         self.study = StudyAutomation(self)
+        self.ai_homework = AIHomeworkAutomation(self)
 
     def install(self) -> None:
         self.worker.command_handlers.update({
+            "chaoxing_start": self.start_edge,
             "chaoxing_refresh": self.refresh_all,
             "chaoxing_open_space": self.open_space,
             "chaoxing_open_course": self.open_course,
             "chaoxing_study": self.study.study_incomplete,
+            "chaoxing_ai_menu": self.set_ai_menu,
         })
+        # 批改菜单注入与页面命令轮询挂在宿主空闲钩子上：不占用任务闸门，
+        # 与「开始学习」「刷新全部数据」等命令互不阻塞（见 docs/commands-and-events.md）
+        self.worker.idle_pollers.append(self.ai_homework.service_menu)
+
+    def _read_menu_enabled(self) -> bool:
+        try:
+            payload = json.loads(self.ai_settings_file.read_text(encoding="utf-8"))
+            return bool(payload.get("menu_enabled")) if isinstance(payload, dict) else False
+        except (OSError, ValueError):
+            return False
+
+    def ai_settings_agent_id(self) -> str:
+        """批改用的 Agent id（「学习通设置」页选择并保存）。"""
+        try:
+            payload = json.loads(self.ai_settings_file.read_text(encoding="utf-8"))
+            return str(payload.get("agent_id") or "") if isinstance(payload, dict) else ""
+        except (OSError, ValueError):
+            return ""
+
+    def set_ai_menu(self, enabled: bool = False, **_payload: Any) -> None:
+        """工作台工具栏「批改作业」开关：开启/关闭页面批改菜单。"""
+        self.ai_homework.set_menu_enabled(bool(enabled))
 
     def _emit(self, event_type: str, **payload: Any) -> None:
         self.worker.emit(event_type, **payload)
@@ -173,11 +220,7 @@ class ChaoxingAssistantWorker:
         try:
             cookies = [
                 item for item in self.worker.context.cookies()
-                if (
-                    isinstance(item, dict)
-                    and item.get("name")
-                    and str(item.get("domain") or "").lstrip(".").endswith(("zufe.edu.cn", "chaoxing.com"))
-                )
+                if self._is_auth_cookie(item)
             ]
         except Exception as exc:
             self.worker.log(f"读取登录 Cookie 失败：{exc}", "warning")
@@ -208,44 +251,97 @@ class ChaoxingAssistantWorker:
             "note": "本文件包含学习通登录 Cookie 快照，仅保存在本机插件 runtime 目录，请勿分享。",
         }
         self._write_json(self.auth_file, payload)
+        self._persist_auth_cookies(cookies)
         self.worker.log(f"已缓存学习通登录 Cookie {len(cookies)} 条及页面存储快照。", "success")
         return len(cookies)
 
+    def _is_auth_cookie(self, item: Any) -> bool:
+        """是否属于学习通登录体系的 Cookie（学校平台与超星主站）。"""
+        return (
+            isinstance(item, dict)
+            and bool(item.get("name"))
+            and str(item.get("domain") or "").lstrip(".").endswith(AUTH_COOKIE_DOMAIN_SUFFIXES)
+        )
+
+    def _persistent_auth_cookie(self, item: dict[str, Any]) -> dict[str, Any]:
+        """复制 Cookie 并把会话级/已过期的有效期改为长期，使其能写入资料目录。"""
+        cookie = {key: value for key, value in item.items() if key in AUTH_COOKIE_FIELDS}
+        try:
+            expires = float(cookie.get("expires") or -1)
+        except (TypeError, ValueError):
+            expires = -1.0
+        if expires <= 0 or expires < time.time():
+            cookie["expires"] = time.time() + AUTH_COOKIE_PERSIST_DAYS * 86400
+        return cookie
+
+    def _persist_auth_cookies(self, cookies: list[dict[str, Any]]) -> int:
+        """把独立 Edge 中的会话级登录 Cookie 就地转为持久化。
+
+        学习通登录的关键凭证（UID/_uid/vc3/cx_p_token/p_auth_token 等）是会话级
+        Cookie（expires=-1），Chromium 关闭浏览器即从资料目录删除；改写有效期后
+        Cookie 落盘，重启浏览器仍保持登录。
+        """
+        if self.worker.context is None or not cookies:
+            return 0
+        rewrites: list[dict[str, Any]] = []
+        for item in cookies:
+            try:
+                expires = float(item.get("expires") or -1)
+            except (TypeError, ValueError):
+                expires = -1.0
+            if expires > 0 and expires >= time.time():
+                continue
+            rewrites.append(self._persistent_auth_cookie(item))
+        if not rewrites:
+            return 0
+        try:
+            self.worker.context.add_cookies(rewrites)
+        except Exception as exc:
+            self.worker.log(f"持久化学习通登录 Cookie 失败：{exc}", "warning")
+            return 0
+        self.worker.log(f"已将 {len(rewrites)} 条会话级登录 Cookie 转为持久化，关闭浏览器后仍可保持登录。", "success")
+        return len(rewrites)
+
     def _restore_auth_state(self) -> None:
-        """在专用资料目录失效或重置时，用本机 Cookie 快照补回登录状态。"""
+        """用本机 Cookie 快照补回资料目录里缺失的登录状态。
+
+        学习通登录的关键 Cookie 是会话级，浏览器关闭即被删除，资料目录里往往
+        只剩 fid/xxtenc 等少数长期 Cookie；因此不能「已有 Cookie 就跳过恢复」，
+        而要按 名称+域名+路径 逐条比对，缺哪条补哪条，并顺带转为持久化。
+        """
         if not self.auth_file.exists() or self.worker.context is None:
             return
         try:
-            existing = [
-                item for item in self.worker.context.cookies()
-                if (
-                    isinstance(item, dict)
-                    and str(item.get("domain") or "").lstrip(".").endswith(("zufe.edu.cn", "chaoxing.com"))
-                )
-            ]
-        except Exception:
-            existing = []
-        if existing:
-            self.worker.log("独立 Edge 资料目录已有学习通 Cookie，跳过快照恢复。", "info")
-            return
-        try:
             payload = json.loads(self.auth_file.read_text(encoding="utf-8"))
-        except Exception:
+        except (OSError, ValueError):
             return
-        cookies = payload.get("cookies") if isinstance(payload, dict) else None
-        if not isinstance(cookies, list) or not cookies:
-            return
-        allowed = {"name", "value", "url", "domain", "path", "expires", "httpOnly", "secure", "sameSite"}
-        safe_cookies = [
-            {key: value for key, value in item.items() if key in allowed}
-            for item in cookies
-            if isinstance(item, dict) and item.get("name") and item.get("value") is not None
-        ]
-        if not safe_cookies:
+        snapshot = payload.get("cookies") if isinstance(payload, dict) else None
+        if not isinstance(snapshot, list) or not snapshot:
             return
         try:
-            self.worker.context.add_cookies(safe_cookies)
-            self.worker.log(f"已从本机缓存恢复学习通登录 Cookie {len(safe_cookies)} 条。", "info")
+            existing_keys = {
+                (item.get("name"), item.get("domain"), item.get("path"))
+                for item in self.worker.context.cookies()
+                if self._is_auth_cookie(item)
+            }
+        except Exception:
+            existing_keys = set()
+        missing = [
+            self._persistent_auth_cookie(item)
+            for item in snapshot
+            if self._is_auth_cookie(item)
+            and item.get("value") is not None
+            and (item.get("name"), item.get("domain"), item.get("path")) not in existing_keys
+        ]
+        if not missing:
+            self.worker.log("独立 Edge 登录 Cookie 完整，无需从本机快照恢复。", "info")
+            return
+        try:
+            self.worker.context.add_cookies(missing)
+            self.worker.log(
+                f"已从本机快照补回学习通登录 Cookie {len(missing)} 条（会话 Cookie 已持久化，重启浏览器不掉线）。",
+                "success",
+            )
         except Exception as exc:
             self.worker.log(f"恢复学习通登录 Cookie 失败，将继续使用持久资料目录：{exc}", "warning")
 
@@ -289,12 +385,13 @@ class ChaoxingAssistantWorker:
                 return False
             if self._has_profile(page):
                 self.worker.log("已检测到学习通登录状态，继续同步。", "success")
+                self.worker.spider_celebrate(page)
                 return True
 
         self._emit(
             "chaoxing_run_status",
             state="error",
-            message="等待登录超时。请在独立 Edge 中登录后重新点击「同步全部数据」。",
+            message="等待登录超时。请在独立 Edge 中登录后重新点击「刷新全部数据」。",
             current=0,
             total=4,
         )
@@ -302,6 +399,8 @@ class ChaoxingAssistantWorker:
         return False
 
     def _extract_profile(self, page: Any) -> dict[str, Any]:
+        # 蜘蛛特效联动：读取资料前先爬到昵称上接触采集（特效关闭时静默跳过）
+        self.worker.spider_fetch_element(page, selector="#space_nickname p.personalName", padding=10)
         payload = page.evaluate(PROFILE_EXTRACTION_SCRIPT)
         if not isinstance(payload, dict):
             payload = {}
@@ -316,17 +415,8 @@ class ChaoxingAssistantWorker:
         except Exception as exc:
             raise RuntimeError("未找到课程列表 iframe，请确认已进入学习通个人空间首页。") from exc
 
-        more = frame.locator("#gddiv a.w_hbluebtn")
-        try:
-            if more.count() and more.is_visible():
-                more.click()
-                # 历史课程由 /studyApp/studied 返回；给页面稳定插入 HTML 的时间。
-                for _ in range(20):
-                    page.wait_for_timeout(300)
-                    if frame.locator("#getdiv dl.w_cour_row").count() > 0:
-                        break
-        except Exception as exc:
-            self.worker.log(f"加载更多课程时出现问题，将先读取当前页面已有课程：{exc}", "warning")
+        # 蜘蛛特效联动：读取课程前先爬到课程列表区域接触采集
+        self.worker.spider_fetch_element(page, selector="#frame_content", padding=4)
 
         items = frame.locator("dl.w_cour_row").evaluate_all(COURSE_EXTRACTION_SCRIPT)
         courses: list[dict[str, Any]] = []
@@ -336,13 +426,15 @@ class ChaoxingAssistantWorker:
             title = self._clean(item.get("title"))
             if not title:
                 continue
-            is_current = bool(item.get("isCurrent"))
+            # 只采集在读课程（onexk）；历史课程（已结课）一律丢弃
+            if not item.get("isCurrent"):
+                continue
             courses.append({
                 "title": title,
                 "type": self._clean(item.get("type")) or "课程",
                 "term": self._clean(item.get("term")) or "未标注学期",
-                "is_current": is_current,
-                "status": "进行中" if is_current else "已结课",
+                "is_current": True,
+                "status": "进行中",
                 "course_url": self._clean(item.get("courseUrl")),
                 "course_id": self._clean(item.get("courseId")),
                 "cover_url": self._clean(item.get("coverUrl")),
@@ -356,26 +448,25 @@ class ChaoxingAssistantWorker:
                 "overall_text": self._clean(item.get("overallText")),
                 "overall_progress": self._number(item.get("overallProgress")),
                 "score": self._number(item.get("score")),
-                "action_text": self._clean(item.get("statusText")) or ("进入学习" if is_current else "回顾课程"),
+                "action_text": self._clean(item.get("statusText")) or "进入学习",
                 "raw_text": self._clean(item.get("rawText")),
             })
         return courses
 
     @staticmethod
     def _summarize(courses: list[dict[str, Any]]) -> dict[str, Any]:
-        current = [course for course in courses if course.get("is_current")]
-        history = [course for course in courses if not course.get("is_current")]
         progress_values = [
             float(course["overall_progress"])
             for course in courses
             if course.get("overall_progress") is not None
         ]
-        completed = sum(1 for value in progress_values if value >= 99.9)
+        completed = sum(1 for course in courses if course_is_done(course))
         return {
             "total": len(courses),
-            "current": len(current),
-            "history": len(history),
+            "current": len(courses),
+            "history": 0,
             "completed": completed,
+            "unfinished": len(courses) - completed,
             "average_progress": round(sum(progress_values) / len(progress_values), 1) if progress_values else None,
         }
 
@@ -402,7 +493,7 @@ class ChaoxingAssistantWorker:
             self._emit("chaoxing_profile_status", state="done", message="基本信息已缓存。")
 
             self._check_cancelled()
-            self._emit("chaoxing_run_status", state="running", message="正在读取学历课程…", current=2, total=4)
+            self._emit("chaoxing_run_status", state="running", message="正在读取在读课程…", current=2, total=4)
             courses = self._extract_courses(page)
             self._capture_auth_state(page)
             stats = self._summarize(courses)
@@ -415,15 +506,17 @@ class ChaoxingAssistantWorker:
             }
             self._write_json(self.courses_file, payload)
             self._emit("chaoxing_courses_data", data=payload)
+            self.worker.spider_celebrate(page)
             self._emit(
                 "chaoxing_run_status",
                 state="done",
-                message=f"同步完成：用户 {profile.get('display_name') or '未知'}，课程 {stats['total']} 门；登录 Cookies 已缓存。",
+                message=f"同步完成：用户 {profile.get('display_name') or '未知'}，在读课程 {stats['total']} 门；登录 Cookies 已缓存。",
                 current=4,
                 total=4,
             )
             self.worker.log(
-                f"学习通同步完成：基本信息已缓存，学历课程 {stats['total']} 门（在读 {stats['current']}，历史 {stats['history']}）。",
+                f"学习通同步完成：基本信息已缓存，在读课程 {stats['total']} 门"
+                f"（已完成 {stats['completed']}，未完成 {stats['unfinished']}）；历史课程不采集。",
                 "success",
             )
         except TaskCancelled:
@@ -434,6 +527,23 @@ class ChaoxingAssistantWorker:
             self.worker.log(message, "error")
             self._emit("chaoxing_run_status", state="error", message=message, current=0, total=4)
 
+    def start_edge(self, **_payload: Any) -> None:
+        """仅启动本插件的独立 Edge（不执行同步/学习任务），供页头「▶ 启动」使用。"""
+        try:
+            self.worker.start_browser()
+            self._restore_auth_state()
+            self._emit(
+                "chaoxing_run_status",
+                state="opened",
+                message="独立 Edge 已启动；可点击右上角「刷新全部数据」图标读取课程，或在课程卡片中点击「开始学习」。",
+                current=0,
+                total=0,
+            )
+        except Exception as exc:
+            message = f"启动独立 Edge 失败：{exc}"
+            self.worker.log(message, "error")
+            self._emit("chaoxing_run_status", state="error", message=message, current=0, total=0)
+
     def open_space(self, **_payload: Any) -> None:
         """打开独立 Edge 中的学习通个人空间，便于用户登录或查看。"""
         try:
@@ -441,6 +551,8 @@ class ChaoxingAssistantWorker:
             self._restore_auth_state()
             page = self._open_personal_space()
             if self._has_profile(page):
+                # 已登录则顺手刷新 Cookie 快照，保证本地缓存与最新会话一致
+                self._capture_auth_state(page)
                 message = f"已打开个人空间：{page.url}"
             else:
                 message = "已打开学习通登录页，请使用“学习通”App 扫描二维码登录。"

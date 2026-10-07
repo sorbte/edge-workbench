@@ -27,7 +27,7 @@ pause
 exit /b 1
 
 :check_deps
-"%PYTHON_EXE%" -c "import playwright, customtkinter" >nul 2>nul
+"%PYTHON_EXE%" -c "import playwright, customtkinter, langchain_openai" >nul 2>nul
 if not errorlevel 1 goto run
 
 echo [edge-workbench] Installing dependencies...

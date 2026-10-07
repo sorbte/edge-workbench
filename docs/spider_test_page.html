@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>蜘蛛抓取效果测试页</title>
+<style>
+  body { font-family: "Microsoft YaHei", sans-serif; margin: 24px; background: #f5f6fa; color: #222; }
+  h1 { font-size: 20px; } h2 { font-size: 16px; margin-top: 28px; }
+  #result-list { background: #fff; border: 1px solid #ddd; border-radius: 8px; padding: 12px 20px; max-width: 720px; }
+  #result-list li { margin: 8px 0; }
+  #drawer { background: #fffbe8; border: 1px solid #e0c96b; border-radius: 8px; padding: 12px 20px; max-width: 720px; margin-top: 10px; }
+  #drawer[hidden] { display: none; }
+  button { padding: 6px 14px; margin-right: 8px; cursor: pointer; }
+  #status { font: 12px/1.6 Consolas, monospace; color: #555; margin-top: 16px; white-space: pre-line; }
+</style>
+</head>
+<body>
+<h1>蜘蛛抓取效果测试页（配合 docs/spider-api.md 的宠物联动）</h1>
+<p>由测试脚本 / 工作台注入宠物特效后，点击下面的按钮观察抓取行为：</p>
+
+<h2>1. 大块数据（模拟搜索结果，30 条）</h2>
+<button id="fetch-list">抓取结果列表</button>
+<ul id="result-list"></ul>
+
+<h2>2. 抽屉（点击展开后才出现的 + 动态插入的内容）</h2>
+<button id="drawer-toggle">打开抽屉</button>
+<div id="drawer-region" style="min-height: 220px; margin-top: 10px;">
+  <div id="drawer" hidden>
+    <h3>今日积分明细（抽屉标题）</h3>
+    <p>每日搜索 已完成 +20 积分，Edge 浏览奖励 已完成 +10 积分，问卷调查 待完成 +50 积分。</p>
+    <!-- 展开时由 JS 动态插入一段文本，验证增量补扫 -->
+  </div>
+</div>
+
+<div id="status">点击按钮后在控制台/测试脚本中查看 collected 渐进、抽屉标记与提示窗。</div>
+
+<script>
+  const list = document.getElementById("result-list");
+  const topics = ["积分", "浏览器", "搜索引擎", "自动化", "宠物特效", "爬虫", "任务", "奖励", "打卡", "签到"];
+  for (let i = 1; i <= 30; i++) {
+    const li = document.createElement("li");
+    const t1 = topics[i % topics.length], t2 = topics[(i * 3 + 1) % topics.length];
+    li.textContent = `结果 ${i} ： ${t1} 专题 第 ${i} 期 内容 摘要 ， 包含 ${t2} 相关 的 详细 说明 与 延伸 阅读 链接 。`;
+    list.appendChild(li);
+  }
+
+  const drawer = document.getElementById("drawer");
+  document.getElementById("drawer-toggle").addEventListener("click", () => {
+    drawer.hidden = false;
+    if (!drawer.dataset.filled) {
+      drawer.dataset.filled = "1";
+      const p = document.createElement("p");
+      p.textContent = "动态补充 ： 签到 奖励 +5 积分 已 到账 ， 连续 打卡 7 天 额外 +30 积分 。";
+      drawer.appendChild(p);
+    }
+  });
+
+  function fetchBox(box) {
+    const w = window.__wbs;
+    if (!w) { alert("宠物特效尚未注入"); return; }
+    w.fetchRect(box.x - 8, box.y - 8, box.width + 16, box.height + 16);
+    tick();
+  }
+  document.getElementById("fetch-list").addEventListener("click", () => fetchBox(document.getElementById("result-list").getBoundingClientRect()));
+
+  function tick() {
+    const w = window.__wbs;
+    if (!w) return;
+    const s = w.state();
+    document.getElementById("status").textContent =
+      `collected=${s.collected} / words=${s.words}  fetching=${s.fetching}\n宠物位置 (x=${Math.round(s.x)}, y=${Math.round(s.y)})`;
+    if (s.fetching) setTimeout(tick, 120);
+  }
+</script>
+</body>
+</html>

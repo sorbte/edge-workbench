@@ -45,7 +45,9 @@ class MicrosoftPointsAssistantPlugin(WorkbenchPlugin):
         self._status_var = tk.StringVar(value=f"数据文件: {self.rewards_data_file.name}")
         self._account_line_var = tk.StringVar(value="账户信息：尚未获取")
         self._search_task_var = tk.StringVar(value="搜索任务未启动")
+        self._search_gained_var = tk.StringVar(value="上涨积分 --")
         self._daily_task_var = tk.StringVar(value="每日任务未启动")
+        self._daily_gained_var = tk.StringVar(value="上涨积分 --")
         self._empty_reason_var = tk.StringVar(value="尚未获取数据。请启动浏览器并登录 Microsoft 账号。")
         self._rule_labels: dict[str, ctk.CTkLabel] = {}
         self._runtime_state_var = tk.StringVar(value="未启动")
@@ -163,7 +165,7 @@ class MicrosoftPointsAssistantPlugin(WorkbenchPlugin):
         ctk.CTkLabel(empty_center, text="暂无 Rewards 数据", text_color=COLORS["text"], font=sans_font(15, "bold")).pack(pady=(14, 8))
         ctk.CTkLabel(empty_center, textvariable=self._empty_reason_var, justify="center", wraplength=560, text_color=COLORS["muted"], font=sans_font(11)).pack()
         ctk.CTkLabel(empty_center, text="登录完成后点击下方按钮重新获取", text_color=COLORS["muted"], font=sans_font(10)).pack(pady=(10, 16))
-        empty_fetch_button = self.app._button(empty_center, "刷新全部数据", self.fetch_rewards_data, "primary", 130)
+        empty_fetch_button = self.app._button(empty_center, "获取基本数据", self.fetch_rewards_data, "primary", 130)
         empty_fetch_button.pack()
         self.app._bind_busy("rewards_data", empty_fetch_button)
 
@@ -203,7 +205,17 @@ class MicrosoftPointsAssistantPlugin(WorkbenchPlugin):
 
         search_card = self.app._card(self.data_frame, padded=True)
         self.app._section_label(search_card, "SEARCH TASK / 搜索任务", top=12)
-        ctk.CTkLabel(search_card, textvariable=self._search_task_var, text_color=COLORS["muted"], font=sans_font(11), anchor="w").pack(fill="x", padx=16)
+        search_status_row = ctk.CTkFrame(search_card, fg_color="transparent")
+        search_status_row.pack(fill="x", padx=16)
+        ctk.CTkLabel(search_status_row, textvariable=self._search_task_var, text_color=COLORS["muted"], font=sans_font(11), anchor="w").pack(side="left", fill="x", expand=True)
+        self._search_gained_label = ctk.CTkLabel(
+            search_status_row,
+            textvariable=self._search_gained_var,
+            text_color=COLORS["success"],
+            font=sans_font(11, "bold"),
+            anchor="e",
+        )
+        self._search_gained_label.pack(side="right", padx=(10, 0))
         self.search_progress = ctk.CTkProgressBar(search_card, height=8, corner_radius=4, fg_color=COLORS["border"], progress_color=COLORS["accent"])
         self.search_progress.pack(fill="x", padx=16, pady=(10, 10))
         self.search_progress.set(0)
@@ -217,7 +229,17 @@ class MicrosoftPointsAssistantPlugin(WorkbenchPlugin):
 
         daily_card = self.app._card(self.data_frame, padded=True)
         self.app._section_label(daily_card, "DAILY TASKS / 每日任务", top=12)
-        ctk.CTkLabel(daily_card, textvariable=self._daily_task_var, text_color=COLORS["muted"], font=sans_font(11), anchor="w").pack(fill="x", padx=16)
+        daily_status_row = ctk.CTkFrame(daily_card, fg_color="transparent")
+        daily_status_row.pack(fill="x", padx=16)
+        ctk.CTkLabel(daily_status_row, textvariable=self._daily_task_var, text_color=COLORS["muted"], font=sans_font(11), anchor="w").pack(side="left", fill="x", expand=True)
+        self._daily_gained_label = ctk.CTkLabel(
+            daily_status_row,
+            textvariable=self._daily_gained_var,
+            text_color=COLORS["success"],
+            font=sans_font(11, "bold"),
+            anchor="e",
+        )
+        self._daily_gained_label.pack(side="right", padx=(10, 0))
         self.daily_progress = ctk.CTkProgressBar(daily_card, height=8, corner_radius=4, fg_color=COLORS["border"], progress_color=COLORS["accent"])
         self.daily_progress.pack(fill="x", padx=16, pady=(10, 10))
         self.daily_progress.set(0)
@@ -278,12 +300,15 @@ class MicrosoftPointsAssistantPlugin(WorkbenchPlugin):
         self._sync_browser_window_button()
 
     def toggle_browser_window(self) -> None:
-        """独立切换启动时是否显示 Edge 窗口；当前页面不因此中断。"""
+        """独立切换启动时是否显示 Edge 窗口；浏览器运行中时自动重启立即生效。"""
         visible = not self._browser_window_visible
         self.app.set_browser_window_visible(visible)
-        if self._browser_running:
-            self._runtime_detail_var.set("窗口显示设置已更新；重启独立浏览器后生效。")
-            self.log("浏览器正在运行，窗口显示设置将在重启独立浏览器后生效。", "warning")
+        if not self._browser_running or self.runtime.current_command == "restart":
+            return  # 浏览器未运行时下次启动生效；自动重启已在进行中则忽略连点
+        self._runtime_detail_var.set("窗口显示模式已切换，正在自动重启独立浏览器…")
+        self.log("窗口显示模式已切换，正在自动重启独立浏览器…", "info")
+        self.worker.cancel_search_task()
+        self.submit("restart")
 
     def _set_runtime_state(self, state: str, detail: str = "") -> None:
         """Update this plugin's own runtime indicator inside its page."""
@@ -374,7 +399,8 @@ class MicrosoftPointsAssistantPlugin(WorkbenchPlugin):
                 if command == "stop":
                     self._set_runtime_state("stopped", "独立浏览器已停止。")
                 else:
-                    self._set_runtime_state("ready", f"命令已完成: {command}")
+                    label = {"restart": "重启浏览器"}.get(command, command)
+                    self._set_runtime_state("ready", f"命令已完成: {label}")
         elif event_type == "plugin_process_error":
             self._set_runtime_state("error", str(event.get("message") or "插件进程异常"))
 
@@ -426,12 +452,14 @@ class MicrosoftPointsAssistantPlugin(WorkbenchPlugin):
                     f"准备新闻 {plan.get('news_needed', 0)} 条"
                 )
             self._search_task_var.set(message)
+            self._update_gained_label(self._search_gained_var, event, state)
             self._set_flow_progress(self.search_progress, event, state)
             if not self._auto_running_ui:
                 self.search_start_button.configure(state="disabled" if running else "normal")
             self.search_cancel_button.configure(state="normal" if running else "disabled")
         else:
             self._daily_task_var.set(message)
+            self._update_gained_label(self._daily_gained_var, event, state)
             self._set_flow_progress(self.daily_progress, event, state)
             if not self._auto_running_ui:
                 self.daily_trigger_button.configure(state="disabled" if running else "normal")
@@ -445,6 +473,17 @@ class MicrosoftPointsAssistantPlugin(WorkbenchPlugin):
             self._set_runtime_state("cancelled", message)
         elif state == "error":
             self._set_runtime_state("error", message)
+
+    def _update_gained_label(self, var: tk.StringVar, event: dict[str, Any], state: str) -> None:
+        """更新任务卡片右上角的「上涨积分」（当前积分 - 任务开始时的账户积分）。"""
+        gained = event.get("gained")
+        if gained is not None:
+            try:
+                var.set(f"上涨积分 +{int(gained)}")
+            except (TypeError, ValueError):
+                pass
+        elif state == "planning":
+            var.set("上涨积分 --")
 
     @staticmethod
     def _set_flow_progress(bar: Any, event: dict[str, Any], state: str) -> None:
@@ -498,7 +537,6 @@ class MicrosoftPointsAssistantPlugin(WorkbenchPlugin):
         self._rewards_ok = True
         today_points = data.get("today_points")
         account_points = data.get("account_points")
-        task_progress = self._progress_text(data.get("daily_task_progress"))
         points_progress = self._progress_text(data.get("today_points_progress"))
         edge_progress = self._progress_text(data.get("edge_browsing"))
         completed = data.get("daily_tasks_completed", 0)
@@ -506,18 +544,9 @@ class MicrosoftPointsAssistantPlugin(WorkbenchPlugin):
         summary = (
             f"今日积分 {today_points if today_points is not None else '--'}  ·  "
             f"账户积分 {account_points if account_points is not None else '--'}  ·  "
-            f"日常任务 {task_progress}  ·  已完成 {completed} / 未完成 {pending}  ·  "
+            f"每日任务 {completed}/{completed + pending}  ·  "
             f"当日进度 {points_progress}  ·  Edge 浏览 {edge_progress} 分钟"
         )
-        tasks = data.get("daily_tasks") or []
-        if tasks:
-            preview = "  |  ".join(
-                f"{'✓' if task.get('completed') else '○'} {task.get('title', '未命名')} +{task.get('points', 0)}"
-                for task in tasks[:8]
-            )
-            summary += f"\n带积分任务：{preview}"
-        else:
-            summary += "\n未识别到带积分的日常任务（无积分选项已自动排除）。"
         self._summary_var.set(summary)
         fetched_at = data.get("fetched_at") or now_text()
         self._status_var.set(f"最近更新: {fetched_at}  ·  文件: {self.rewards_data_file.name}")
@@ -583,6 +612,7 @@ class MicrosoftPointsAssistantPlugin(WorkbenchPlugin):
         self.search_cancel_button.configure(state="normal")
         self._set_runtime_state("running", "正在准备搜索任务。")
         self._search_task_var.set("正在计算搜索计划…")
+        self._search_gained_var.set("上涨积分 --")
         self.search_progress.set(0)
         self.submit("search_task")
 
@@ -601,6 +631,7 @@ class MicrosoftPointsAssistantPlugin(WorkbenchPlugin):
         self.daily_cancel_button.configure(state="normal")
         self._set_runtime_state("running", "正在触发未完成的每日任务。")
         self._daily_task_var.set("正在扫描每日任务 / 每日活动…")
+        self._daily_gained_var.set("上涨积分 --")
         self.daily_progress.set(0)
         self.submit("trigger_tasks")
 
@@ -611,7 +642,7 @@ class MicrosoftPointsAssistantPlugin(WorkbenchPlugin):
 
     def open_rewards_data_file(self) -> None:
         if not self.rewards_data_file.exists():
-            messagebox.showinfo("Rewards 数据", "还没有数据文件，请先点击「刷新全部数据」。")
+            messagebox.showinfo("Rewards 数据", "还没有数据文件，请先点击「获取基本数据」。")
             return
         os.startfile(self.rewards_data_file)
 
@@ -631,6 +662,8 @@ class MicrosoftPointsAssistantPlugin(WorkbenchPlugin):
         self._rewards_ok = False
         self._account_ok = False
         self._summary_var.set("尚未获取 Rewards 数据；点击「刷新全部数据」开始。")
+        self._search_gained_var.set("上涨积分 --")
+        self._daily_gained_var.set("上涨积分 --")
         self._status_var.set(f"数据文件: {self.rewards_data_file.name}")
         self._account_line_var.set("账户信息：尚未获取")
         self._empty_reason_var.set("缓存已清理。启动浏览器并登录 Microsoft 账号后可重新获取。")

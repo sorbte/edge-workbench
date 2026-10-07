@@ -140,7 +140,18 @@ class StudyAutomation:
             checks.append(float(progress) >= 99.9)
         return (not checks) or not all(checks)
 
-    def study_incomplete(self, **_payload: Any) -> None:
+    def study_incomplete(
+        self,
+        course_url: str = "",
+        course_id: str = "",
+        course_title: str = "",
+        **_payload: Any,
+    ) -> None:
+        """自动学习未完成章节；携带 course_url/course_id 时只处理指定的那一门课程。
+
+        学习通同一账号同时只能上一门课（并发播放会触发验证码），因此每次任务
+        只针对单门课程；界面侧的「开始学习」按钮按课程发起并互斥。
+        """
         report: dict[str, Any] = {"started_at": now_text(), "courses": [], "status": "running"}
         try:
             self._check_cancelled()
@@ -150,10 +161,31 @@ class StudyAutomation:
             page = self.owner._open_personal_space()
             if not self.owner._wait_for_login(page):
                 return
+            # 登录成功（含任务中途重新扫码）后立即回写 Cookie 快照，避免快照过期
+            self.owner._capture_auth_state(page)
             self._emit(state="running", message="正在读取课程列表…", current=0, total=1)
             courses = self.owner._extract_courses(page)
             # 先检查所有在读课程；章节目录会进一步确认哪些章节真正未完成。
             candidates = [course for course in courses if course.get("is_current") and course.get("course_url")]
+            target_url = self._text(course_url)
+            target_id = self._text(course_id)
+            if target_url:
+                matched = [
+                    course for course in candidates
+                    if (target_id and self._text(course.get("course_id")) == target_id)
+                    or self._text(course.get("course_url")) == target_url
+                ]
+                if matched:
+                    candidates = matched
+                else:
+                    # 课程列表里找不到（缓存过期等）时，直接用界面传来的课程入口学习
+                    candidates = [{
+                        "title": self._text(course_title) or "指定课程",
+                        "course_url": target_url,
+                        "course_id": target_id,
+                        "is_current": True,
+                    }]
+                    self._log("课程列表中未找到指定课程，使用缓存的课程入口直接进入学习。", "warning")
             total = len(candidates)
             if total == 0:
                 report.update({"status": "done", "finished_at": now_text()})
@@ -170,6 +202,7 @@ class StudyAutomation:
             self.owner._write_json(self.report_file, report)
             abnormal = sum(1 for item in report["courses"] if item.get("status") == "abnormal")
             suffix = f"，{abnormal} 门存在课程异常。" if abnormal else "。"
+            self.worker.spider_celebrate(page)
             self._emit(state="done", message=f"学习流程结束：检查 {total} 门课程{suffix}", current=total, total=total)
         except TaskCancelled:
             report.update({"status": "cancelled", "finished_at": now_text()})
@@ -249,6 +282,8 @@ class StudyAutomation:
         if locator.count() == 0:
             locator = frame.get_by_text(self._text(chapter.get("title")), exact=False).first
         locator.scroll_into_view_if_needed(timeout=10_000)
+        # 蜘蛛特效联动：点击前抢先冲刺到章节标题上（特效关闭时静默跳过）
+        self.worker.spider_dash_to(page, element=locator, wait=420)
         locator.click(timeout=10_000)
         try:
             page.wait_for_url(re.compile(r".*/mycourse/studentstudy.*"), timeout=45_000)
@@ -293,6 +328,8 @@ class StudyAutomation:
             self._complete_task_points(page, chapter_title, course_index, total)
             page.wait_for_timeout(1_500)
             if self._chapter_complete(page):
+                # 蜘蛛特效联动：章节学完，原地迸发粒子庆祝
+                self.worker.spider_burst(page, count=12)
                 return True
             self._emit(state="warning", message=f"{chapter_title}：仍有任务点未完成，准备再次检查。", current=course_index, total=total)
             page.wait_for_timeout(1_000)
@@ -339,6 +376,13 @@ class StudyAutomation:
             if bool(initial.get("ended")) or (duration > 0 and float(initial.get("currentTime") or 0) >= duration * 0.95):
                 continue
             self._emit(state="running", message=f"{chapter_title}：正在播放视频…", current=course_index, total=total)
+            # 蜘蛛特效联动：播放前冲刺到视频画面上陪看（短超时，避免无视频时阻塞）
+            try:
+                video_box = frame.locator("video").first.bounding_box(timeout=2_000)
+            except Exception:
+                video_box = None
+            if video_box:
+                self.worker.spider_dash_to(page, box=video_box, wait=400)
             deadline = time.monotonic() + (max(600.0, min(21_600.0, duration * 1.6 + 180.0)) if duration > 0 else 21_600.0)
             last_report = 0.0
             while time.monotonic() < deadline:
@@ -352,6 +396,8 @@ class StudyAutomation:
                 current = float(state.get("currentTime") or 0)
                 total_seconds = float(state.get("duration") or duration or 0)
                 if bool(state.get("ended")) or (total_seconds > 0 and current >= total_seconds * 0.95):
+                    # 蜘蛛特效联动：视频看完，原地泛起涟漪
+                    self.worker.spider_ring(page)
                     break
                 now = time.monotonic()
                 if now - last_report >= 15.0:
@@ -376,6 +422,8 @@ class StudyAutomation:
                 frames.append(frame)
         if not frames:
             return
+        # 蜘蛛特效联动：翻阅前冲刺到内容区
+        self.worker.spider_dash_to(page, selector="#iframe", wait=400)
         for round_index in range(1, 4):
             self._check_cancelled()
             for frame in frames:
@@ -395,6 +443,8 @@ class StudyAutomation:
         for frame in extra:
             if frame not in frames:
                 frames.append(frame)
+        # 蜘蛛特效联动：翻页阅读前冲刺到内容区
+        self.worker.spider_dash_to(page, selector="#iframe", wait=400)
         for round_index in range(1, 4):
             self._check_cancelled()
             clicked = False
